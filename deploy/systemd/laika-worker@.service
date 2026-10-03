@@ -1,0 +1,41 @@
+[Unit]
+Description=LAIka worker %i
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+User=laika
+Group=laika
+# The dedicated user (services/laika_user.py): agents and tests never run as
+# root. Shared data stays group-writable for the root control services.
+UMask=0007
+Environment=HOME=/var/lib/laika/home
+Environment=GIT_CONFIG_GLOBAL=/etc/laika/gitconfig
+# The claude CLI cannot update itself here; `laika update` updates it.
+Environment=DISABLE_AUTOUPDATER=1
+# Secrets as environment (read by systemd; the files stay root-only).
+EnvironmentFile=-/etc/laika/redis.env
+Type=simple
+WorkingDirectory=/opt/laika
+Environment=PYTHONUNBUFFERED=1
+Environment=REDIS_URL=redis://127.0.0.1:6379/0
+Environment=WORKER_QUEUE=laika:jobs
+Environment=WORKER_ID=laika-worker-%i
+Environment=WORKER_ROLE=builder
+Environment=LAIKA_PYTHON=/var/lib/laika/venv/bin/python
+Environment=BUILDER_TIMEOUT_SECONDS=900
+Environment=REPAIR_TIMEOUT_SECONDS=600
+EnvironmentFile=-/etc/laika/laika.env
+EnvironmentFile=-/etc/laika/providers/providers.env
+ExecStart=/var/lib/laika/venv/bin/python /opt/laika/services/worker/worker.py
+Restart=always
+RestartSec=3
+# One runaway test cannot take the whole server down: above 3 GB the worker
+# is slowed; at 4 GB the kernel kills its biggest process (normally the
+# test, which then fails; if it is the worker, systemd restarts it and the
+# lost job is retried). The scaler drains workers on memory pressure first.
+MemoryHigh=3G
+MemoryMax=4G
+
+[Install]
+WantedBy=multi-user.target

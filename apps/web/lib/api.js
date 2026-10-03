@@ -1,0 +1,150 @@
+import { asArray, asObject } from './format.js';
+
+export const ENDPOINTS = [
+  'status',
+  'repository',
+  'queue',
+  'orchestrators',
+  'workers',
+  'heartbeat',
+  'goals',
+  'jobs',
+  'approvals',
+  'failures'
+];
+export const HISTORY_PAGE_SIZE = 25;
+export const normalize = (key, value) =>
+  ['repository', 'queue', 'status', 'heartbeat'].includes(key) ? asObject(value) || {} : asArray(value);
+export async function fetchEndpoint(key, fetchImpl = fetch) {
+  const path = ['goals', 'jobs', 'approvals', 'failures'].includes(key) ? `/api/${key}?limit=100` : `/api/${key}`;
+  const response = await fetchImpl(path, { headers: { accept: 'application/json' } });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    throw new Error('Malformed JSON');
+  }
+  const collection = !['status', 'repository', 'queue', 'heartbeat'].includes(key);
+  if (
+    (collection && !Array.isArray(body)) ||
+    (!collection && (!body || typeof body !== 'object' || Array.isArray(body)))
+  )
+    throw new Error('Malformed payload');
+  return normalize(key, body);
+}
+export async function fetchHistoryPage(offset, fetchImpl = fetch) {
+  const response = await fetchImpl(`/api/jobs?limit=${HISTORY_PAGE_SIZE}&offset=${offset}`, {
+    headers: { accept: 'application/json' }
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    throw new Error('Malformed JSON');
+  }
+  if (!Array.isArray(body)) throw new Error('Malformed payload');
+  return normalize('jobs', body);
+}
+// Operator token for writes (the API requires it when LAIKA_OPERATOR_TOKEN is
+// set). Kept in this browser only; storage can be unavailable.
+const TOKEN_KEY = 'laika-operator-token';
+export const operatorToken = {
+  get() {
+    try {
+      return globalThis.localStorage?.getItem(TOKEN_KEY) || '';
+    } catch {
+      return '';
+    }
+  },
+  set(value) {
+    try {
+      if (value) globalThis.localStorage?.setItem(TOKEN_KEY, value);
+      else globalThis.localStorage?.removeItem(TOKEN_KEY);
+    } catch {}
+  }
+};
+export const authHeaders = (token = operatorToken.get()) => (token ? { 'x-laika-token': token } : {});
+// crypto.randomUUID() only exists in secure contexts (HTTPS or localhost); the
+// dashboard is usually opened over plain http on the LAN, where it is missing.
+export const newRequestId = () => {
+  if (typeof globalThis.crypto?.randomUUID === 'function') return globalThis.crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+};
+
+// FastAPI validation errors carry a list of {loc, msg}; show them as text.
+export const errorMessage = (body, status) => {
+  const detail = body?.detail ?? body?.message;
+  if (Array.isArray(detail))
+    return detail
+      .map(item => [Array.isArray(item?.loc) ? item.loc.filter(part => part !== 'body').join('.') : '', item?.msg]
+        .filter(Boolean).join(': '))
+      .join('; ') || `HTTP ${status}`;
+  if (detail && typeof detail === 'object') return JSON.stringify(detail);
+  return detail ? String(detail) : `HTTP ${status}`;
+};
+
+export async function requestJSON(path, options = {}, fetchImpl = fetch) {
+  const response = await fetchImpl(path, {
+    ...options,
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      ...authHeaders(),
+      ...(options.headers || {})
+    }
+  });
+  let body = {};
+  try {
+    body = await response.json();
+  } catch {}
+  if (response.status === 401 && typeof window !== 'undefined' && !String(path).startsWith('/api/auth/')) {
+    // Signed out or not set up yet: lib/auth.js shows the right screen.
+    window.dispatchEvent(new CustomEvent('laika:auth-required', { detail: body }));
+  }
+  if (!response.ok) {
+    const error = new Error(errorMessage(body, response.status));
+    error.body = body;
+    error.status = response.status;
+    throw error;
+  }
+  return body;
+}
+export const fetchJobDetail = (jobId, fetchImpl = fetch) =>
+  requestJSON(`/api/jobs/${encodeURIComponent(jobId)}`, {}, fetchImpl);
+export const submitGoal = (goal, atomic = false, request_id = '', fetchImpl = fetch) =>
+  requestJSON(
+    '/api/prompts',
+    { method: 'POST', body: JSON.stringify({ prompt: goal, atomic, request_id: request_id || undefined }) },
+    fetchImpl
+  );
+export const workerAction = (id, action, fetchImpl = fetch) =>
+  requestJSON(`/api/workers/${encodeURIComponent(id)}/${action}`, { method: 'POST' }, fetchImpl);
+export const removeWorker = (id, fetchImpl = fetch) =>
+  requestJSON(`/api/workers/${encodeURIComponent(id)}`, { method: 'DELETE' }, fetchImpl);
+export const jobAction = (jobId, body, fetchImpl = fetch) =>
+  requestJSON(
+    `/api/jobs/${encodeURIComponent(jobId)}/actions`,
+    { method: 'POST', body: JSON.stringify(body) },
+    fetchImpl
+  );
+export const operatorRequest = (requestId, fetchImpl = fetch) =>
+  requestJSON(`/api/operator-requests/${encodeURIComponent(requestId)}`, { method: 'GET' }, fetchImpl);
+// Through requestJSON so the operator token is sent like every other write.
+export const dismiss = (ids, fetchImpl = fetch) =>
+  requestJSON('/api/dismissals', { method: 'POST', body: JSON.stringify({ ids }) }, fetchImpl);
+export async function loadDismissals(fetchImpl = fetch) {
+  const response = await fetchImpl('/api/dismissals');
+  if (!response.ok) throw new Error(`Unable to load dismissals (HTTP ${response.status})`);
+  const body = await response.json();
+  return body.ids;
+}
+export async function handoffText(goalId, fetchImpl = fetch) {
+  const response = await fetchImpl(`/api/goals/${encodeURIComponent(goalId)}/handoff-data`);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const bundle = await response.json();
+  return JSON.stringify(bundle, null, 2);
+}

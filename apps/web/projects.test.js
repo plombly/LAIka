@@ -1,0 +1,212 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  projectListMarkup,
+  projectDetailMarkup,
+  publicKeyMarkup,
+  buildProjectRequest,
+  validateProjectValues,
+  historyMarkup,
+  activityMarkup,
+  deleteProjectMarkup,
+  buildSettingsMarkup,
+  appStatusMarkup,
+  buildSettingsRequest,
+  systemInfoMarkup,
+  trashMarkup
+} from './lib/projects.js';
+
+test('project list markup renders projects and empty state', () => {
+  const markup = projectListMarkup([{
+    id: 'web-shop',
+    name: '<b>x</b>',
+    importance: 'high',
+    status: 'paused',
+    counts: { jobs_queued: 1, jobs_running: 2, jobs_awaiting_approval: 3, jobs_needs_human: 4, jobs_merged: 5 },
+    stats: { remaining_effort: 6 }
+  }]);
+  assert.match(markup, /href="#\/projects\/web-shop"/);
+  assert.match(markup, /queued 1 · running 2 · awaiting approval 3 · needs human 4 · merged 5/);
+  assert.match(markup, /remaining effort 6/);
+  assert.match(markup, /&lt;b&gt;x&lt;\/b&gt;/);
+  assert.doesNotMatch(markup, /<b>x<\/b>/);
+  assert.equal(projectListMarkup([]), '<div class="empty">No projects yet</div>');
+});
+
+test('project page: tabs, overview, settings, retry state, escaping', () => {
+  const project = {
+    id: 'web-shop', name: '<Project>', importance: 'high', status: 'pending_key',
+    goals: [{ prompt: '<goal>', status: 'running', progress: { completed: 1, total: 2 } }],
+    jobs: [{ id: 'job-1', status: 'queued', title: 'Add cart', provider: 'openai', model: 'gpt' }]
+  };
+  const overview = projectDetailMarkup(project);
+  assert.match(overview, /<option value="high" selected>/);
+  assert.match(overview, /data-retry-clone="web-shop"/);
+  assert.match(overview, /data-assist-start="project:/);
+  assert.match(overview, /data-detail="job-1"/);
+  assert.match(overview, /width:50%/);
+  assert.match(overview, /&lt;Project&gt;/);
+  assert.match(overview, /&lt;goal&gt;/);
+  assert.match(overview, /class="active" aria-current="page">Overview/);
+  assert.doesNotMatch(overview, /project-push-form/);
+  const settings = projectDetailMarkup(project, 'settings');
+  assert.match(settings, /id="project-push-form"/);
+  assert.match(settings, /project-settings-form/);
+  assert.doesNotMatch(settings, /data-assist-start/);
+  assert.match(projectDetailMarkup(project, 'files'), /href="#\/projects\/web-shop\/files" class="active"/);
+  assert.doesNotMatch(projectDetailMarkup({ id: 'x', status: 'active' }), /data-retry-clone/);
+});
+
+test('history: one change per job, undo buttons only where allowed', () => {
+  const history = { can_undo: true, changes: [
+    { kind: 'job', job_id: 'j1', title: 'Add <cart>', time: 1000, commits: [{}, {}], complete: true },
+    { kind: 'commit', sha: 'abcdef1234', title: 'Upload logo', author: 'LAIka operator', time: 1000, commits: [{}] },
+    { kind: 'job', job_id: 'j0', title: 'Old', time: 10, commits: [{}], complete: false }
+  ] };
+  const html = historyMarkup(history, 1000 + 7200);
+  assert.match(html, /Add &lt;cart&gt;/);
+  assert.match(html, /data-undo-job="j1"/);
+  assert.match(html, /data-undo-commit="abcdef1234"/);
+  assert.doesNotMatch(html, /data-undo-job="j0"/);
+  assert.match(html, /2 commits · 2 h ago/);
+  assert.doesNotMatch(historyMarkup({ ...history, can_undo: false }), /data-undo/);
+  assert.match(historyMarkup({ changes: [] }), /No history yet/);
+  assert.doesNotMatch(historyMarkup({ can_undo: true, changes: [{ kind: 'commit', sha: 'f00', title: 'Initialize', root: true, commits: [{}] }] }), /data-undo/);
+});
+
+test('public key markup handles valid and invalid output', () => {
+  assert.match(publicKeyMarkup(JSON.stringify({ public_key: '<key>' })), /&lt;key&gt;/);
+  assert.equal(publicKeyMarkup(JSON.stringify({ message: 'no key' })), '');
+  assert.equal(publicKeyMarkup('{bad json'), '');
+});
+
+test('project request trims values and conditionally includes fields', () => {
+  const empty = buildProjectRequest({ id: ' x ', name: ' Name ', importance: ' medium ', source: '', url: 'ignored', push_remote: ' ', gate: '' });
+  assert.deepEqual({ ...empty, request_id: undefined }, { id: 'x', name: 'Name', importance: 'medium', source: '', request_id: undefined });
+  assert.equal(typeof empty.request_id, 'string');
+  const clone = buildProjectRequest({ id: 'x', name: 'Name', importance: 'low', source: 'clone', url: ' https://github.com/x ', push_remote: ' origin ', gate: ' ci ' });
+  assert.equal(clone.url, 'https://github.com/x');
+  assert.equal(clone.push_remote, 'origin');
+  assert.equal(clone.gate, 'ci');
+});
+
+test('project values validate id, name, and clone URL', () => {
+  assert.match(validateProjectValues({ id: 'Bad_Id', name: 'Name' }), /ID/);
+  assert.equal(validateProjectValues({ id: 'good-id', name: 'Name' }), '');
+  assert.match(validateProjectValues({ id: 'good-id', name: '' }), /Name/);
+  assert.match(validateProjectValues({ id: 'good-id', name: 'x'.repeat(81) }), /Name/);
+  assert.match(validateProjectValues({ id: 'good-id', name: 'Name', source: 'clone' }), /URL/);
+});
+
+
+test('list shows the counts the API actually returns (jobs_* keys)', async () => {
+  const { projectListMarkup } = await import('./lib/projects.js');
+  const html = projectListMarkup([{ id: 'laika', name: 'LAIka', importance: 'medium', status: 'active',
+    counts: { jobs_queued: 2, jobs_running: 1, jobs_awaiting_approval: 3, jobs_needs_human: 0, jobs_merged: 42 },
+    stats: { remaining_effort: 5 } }]);
+  assert.match(html, /queued 2 · running 1 · awaiting approval 3 · needs human 0 · merged 42/);
+});
+
+test('delete section on every project page except LAIka itself', () => {
+  assert.match(deleteProjectMarkup('web-shop'), /id="project-delete-form"/);
+  assert.match(deleteProjectMarkup('web-shop'), /placeholder="Type web-shop to confirm"/);
+  assert.match(deleteProjectMarkup('web-shop'), /class="danger-button"/);
+  assert.equal(deleteProjectMarkup('laika'), '');
+  assert.match(projectDetailMarkup({ id: 'web-shop', status: 'active' }, 'settings'), /project-delete-form/);
+  assert.doesNotMatch(projectDetailMarkup({ id: 'laika', status: 'active' }), /project-delete-form/);
+});
+
+test('build & run settings: empty fields stay empty, LAIka has none', () => {
+  const html = buildSettingsMarkup({ id: 'shop', setup_command: '', gate_command: 'npm test', run_command: '' });
+  assert.match(html, /id="project-settings-form"/);
+  assert.match(html, /name="setup_command" value=""/);
+  assert.match(html, /name="gate_command" value="npm test"/);
+  assert.doesNotMatch(html, /value="—"/);
+  assert.doesNotMatch(html, /app-status/);
+  assert.equal(buildSettingsMarkup({ id: 'laika' }), '');
+  assert.deepEqual(buildSettingsRequest({ setup_command: ' npm ci ', gate_command: '', run_command: 'npm start', run_port: '' }),
+    { setup_command: 'npm ci', gate_command: '', run_command: 'npm start' });
+  assert.equal(buildSettingsRequest({ run_port: '8105' }).run_port, 8105);
+});
+
+test('app status links to the app on this server only when running', () => {
+  const running = appStatusMarkup({ id: 'shop', run_command: 'npm start', app: { state: 'running', port: 8100, commit: 'abcdef123456' } }, '192.168.1.20');
+  assert.match(running, /href="http:\/\/192.168.1.20:8100\/"/);
+  assert.match(running, /data-app-restart="shop"/);
+  assert.match(running, /main abcdef12/);
+  const crashed = appStatusMarkup({ id: 'shop', run_command: 'npm start', app: { state: 'crashed', port: 8100, log: '<err>' } }, 'h');
+  assert.doesNotMatch(crashed, /href=/);
+  assert.match(crashed, /&lt;err&gt;/);
+  assert.equal(appStatusMarkup({ id: 'shop', run_command: '' }, 'h'), '');
+});
+
+test('LAIka: labelled as this system, no GitHub push form, shows its host setup', () => {
+  const list = projectListMarkup([{ id: 'laika', name: 'LAIka', importance: 'high', status: 'active', counts: {}, stats: {} }]);
+  assert.match(list, /this system/);
+  const page = projectDetailMarkup({ id: 'laika', name: 'LAIka', status: 'active', system: { remote: 'git@github.com:me/laika.git', branch: 'main', head: 'abc1234', subject: '<b>' } });
+  assert.match(page, /LAIka · THIS SYSTEM/);
+  assert.doesNotMatch(page, /project-push-form/);
+  assert.match(page, /git@github.com:me\/laika.git/);
+  assert.match(page, /main @ abc1234/);
+  assert.match(page, /&lt;b&gt;/);
+  // View only: no goal box, no importance control, read-only notice.
+  assert.doesNotMatch(page, /data-assist-start|id="project-importance"/);
+  assert.match(page, /View only\./);
+  assert.match(projectDetailMarkup({ id: 'shop', status: 'active' }, 'settings'), /project-push-form/);
+  assert.match(systemInfoMarkup(null), /not reported yet/);
+});
+
+test('trash: restorable projects with time left, nothing when empty', () => {
+  const html = trashMarkup([{ trash_id: 'shop-20260930T220000Z', project_id: 'shop', name: '<Shop>', deleted_at: 1000, expires_at: 1000 + 86400 }], 1000 + 3600);
+  assert.match(html, /Recently deleted/);
+  assert.match(html, /data-restore-trash="shop-20260930T220000Z"/);
+  assert.match(html, /removed for good in 23 hours/);
+  assert.match(html, /&lt;Shop&gt;/);
+  assert.equal(trashMarkup([]), '');
+  assert.match(deleteProjectMarkup('shop'), /restore it from the Projects page for 1 day/);
+});
+
+test('build settings include app limits and send only what is filled in', () => {
+  const html = buildSettingsMarkup({ id: 'shop', run_memory_mb: 1024, run_cpus: 1, run_tasks: 512 });
+  assert.match(html, /name="run_memory_mb" value="1024"/);
+  assert.match(html, /name="run_cpus" value="1"/);
+  assert.deepEqual(buildSettingsRequest({ setup_command: '', gate_command: '', run_command: '', run_memory_mb: '256', run_cpus: '', run_tasks: '' }),
+    { setup_command: '', gate_command: '', run_command: '', run_memory_mb: 256 });
+});
+
+test('environment: names and lengths only, never values; not for LAIka', async () => {
+  const { envMarkup } = await import('./lib/projects.js');
+  const html = envMarkup('shop', { variables: [{ name: 'STRIPE_KEY', length: 32 }] });
+  assert.match(html, /<code>STRIPE_KEY<\/code>/);
+  assert.match(html, /32 characters/);
+  assert.match(html, /data-env-delete="STRIPE_KEY"/);
+  assert.match(html, /type="password"/);
+  assert.equal(envMarkup('laika', {}), '');
+  assert.match(envMarkup('shop', null), /No variables yet/);
+});
+
+
+test('activity timeline: icons by kind, job details, times', () => {
+  const html = activityMarkup([
+    { at: 1000, kind: 'merged', title: 'Approved and merged: <Cart>', ref: 'j1' },
+    { at: 900, kind: 'app_problem', title: 'App crashed', detail: 'out of memory' },
+    { at: 800, kind: 'weird', title: 'Something' }
+  ], 1000 + 600);
+  assert.match(html, /tone-ok">✓<\/span>/);
+  assert.match(html, /&lt;Cart&gt; <button type="button" class="detail-button" data-detail="j1">/);
+  assert.match(html, /tone-bad">!<\/span>.*out of memory/s);
+  assert.match(html, /10 min ago/);
+  assert.match(activityMarkup([]), /Nothing has happened/);
+  assert.match(projectDetailMarkup({ id: 'shop', status: 'active' }, 'activity'), /href="#\/projects\/shop\/activity" class="active"/);
+});
+
+test('builder-managed projects (the app) are view-only too', () => {
+  const app = { id: 'app', name: 'App', status: 'active', view_only: true, goals: [], jobs: [] };
+  const page = projectDetailMarkup(app, 'overview');
+  assert.match(page, /View only\./);
+  assert.doesNotMatch(page, /data-assist-start|id="project-importance"|data-build-start|data-group-new-child/);
+  assert.match(page, /href="#\/projects\/app\/builds"/);
+  assert.doesNotMatch(page, /\/app\/settings"|\/app\/files"/);
+  assert.doesNotMatch(projectDetailMarkup({ ...app, builds: { recipe: { label: 'APK' }, builds: [] } }, 'builds'), /data-build-start/);
+  assert.match(projectDetailMarkup({ id: 'shop', status: 'active', goals: [], jobs: [] }, 'overview'), /data-assist-start/);
+});

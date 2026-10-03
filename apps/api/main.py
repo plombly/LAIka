@@ -1,0 +1,1305 @@
+import hmac
+import json
+import io
+import math
+import os
+import re
+import time
+import uuid
+import zipfile
+
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy import create_engine, text
+from redis import Redis
+import os
+
+from database import init_database
+from schemas import DismissalsRequest, GoalAccepted, GoalSubmit, OperatorActionRequest, PromptSubmit, WorkerAction
+
+# Interactive API docs only when asked for (LAIKA_API_DOCS=1): a production
+# API has no reason to describe itself.
+_DOCS = os.environ.get("LAIKA_API_DOCS") == "1"
+app = FastAPI(
+    title="LAIka",
+    version="1.0",
+    docs_url="/docs" if _DOCS else None,
+    redoc_url="/redoc" if _DOCS else None,
+    openapi_url="/openapi.json" if _DOCS else None,
+)
+
+DATABASE_URL = os.environ["DATABASE_URL"]
+REDIS_URL = os.environ["REDIS_URL"]
+
+# Write access control. When LAIKA_OPERATOR_TOKEN is set (host file
+# /etc/laika/operator.env via docker-compose), every request that can change
+# state must carry it in X-Laika-Token. Reads stay open. Web approval is only
+# accepted when a token is configured.
+OPERATOR_TOKEN = os.environ.get("LAIKA_OPERATOR_TOKEN", "")
+_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _token_ok(request):
+    supplied = request.headers.get("x-laika-token", "")
+    return bool(OPERATOR_TOKEN) and hmac.compare_digest(supplied, OPERATOR_TOKEN)
+
+
+@app.middleware("http")
+async def require_operator_token(request: Request, call_next):
+    """Who may do what (apps/api/auth.py): sessions, device keys, the operator
+    token; LAIka itself and its app are view-only (managed.py); every write
+    is audited."""
+    import auth
+    import device_routes
+    import managed
+    request.state.device = None
+    if request.headers.get("authorization"):
+        request.state.device = device_routes.device_for(request)
+    write = request.method not in _READ_METHODS
+    if write:
+        reason = managed.refused(redis, request.method, request.url.path)
+        if reason:
+            return JSONResponse(status_code=403, content={"detail": reason})
+    token_ok = _token_ok(request)
+    actor, status, body = auth.actor_for(request, token_ok, request.state.device)
+    if status:
+        return JSONResponse(status_code=status, content=body)
+    device = request.state.device
+    if write and not token_ok and device is not None:
+        if not device_routes.device_may_write(request.method, request.url.path):
+            return JSONResponse(status_code=403, content={"detail": "This device may not do that; use the dashboard"})
+    elif write and actor == "open" and not token_ok and OPERATOR_TOKEN:
+        # Unlocked installs without an administrator (tests): the old token rule.
+        return JSONResponse(status_code=401, content={
+            "detail": "Operator token required: enter it in the dashboard (X-Laika-Token)"})
+    response = await call_next(request)
+    if write and actor not in ("public",):
+        auth.audit(redis, request, response.status_code, actor)
+    return response
+
+
+engine = create_engine(DATABASE_URL)
+# REDIS_PASSWORD comes from /etc/laika/redis.env (docker-compose env_file).
+redis = Redis.from_url(REDIS_URL, password=os.environ.get("REDIS_PASSWORD") or None, decode_responses=True)
+
+API_DEFAULT_LIMIT = 8
+API_MAX_LIMIT = 100
+GOAL_SUMMARY_LIMIT = 240
+JOB_TERMINAL_STATUSES = {
+    "completed", "completed_no_changes", "merged", "done", "succeeded",
+}
+FAILURE_STATUSES = {"failed", "error", "integration_failed", "queue_failed", "test_failed", "rejected", "repair_exhausted", "blocked_failed_dependency", "planning_failed"}
+
+
+def _text(value, default=None):
+    if value is None:
+        return default
+    value = str(value).strip()
+    return value or default
+
+
+def _number(value, default=None):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number):
+        return default
+    return int(number) if number.is_integer() else number
+
+
+def _float_or_none(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _timestamp(value):
+    return _number(value, 0) or 0
+
+
+def _json_list(value):
+    if isinstance(value, (list, tuple)):
+        values = value
+    else:
+        try:
+            values = json.loads(value or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+    return sorted({str(item).strip() for item in values
+                   if isinstance(item, (str, int, float)) and str(item).strip()}) \
+        if isinstance(values, (list, tuple)) else []
+
+
+def _bounded_summary(value):
+    value = " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
+    if len(value) <= GOAL_SUMMARY_LIMIT:
+        return value
+    return value[:GOAL_SUMMARY_LIMIT - 1] + "…"
+
+
+def _effective_tokens(data):
+    explicit = _number(data.get("effective_tokens"))
+    if explicit is not None:
+        return explicit
+    uncached = _number(data.get("uncached_input_tokens"))
+    output = _number(data.get("output_tokens"))
+    if uncached is None:
+        inputs = _number(data.get("input_tokens"))
+        cached = _number(data.get("cached_input_tokens"), 0)
+        if inputs is not None and cached is not None:
+            uncached = max(inputs - min(cached, inputs), 0)
+    return uncached + output if uncached is not None and output is not None else None
+
+
+def _duration(data):
+    direct = _number(data.get("duration_seconds", data.get("duration")))
+    if direct is not None:
+        return direct
+    started = _number(data.get("started_at", data.get("start_time")))
+    ended = _number(data.get("ended_at", data.get("completed_at", data.get("finished_at"))))
+    if started is not None and ended is not None and ended >= started:
+        return ended - started
+    started = _float_or_none(data.get("started_at"))
+    finished = _float_or_none(data.get("finished_at"))
+    return finished - started if started is not None and finished is not None else None
+
+
+def _key_suffix(key):
+    return str(key).rsplit(":", 1)[-1]
+
+
+def _hash(key):
+    try:
+        value = redis.hgetall(key)
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+# The dashboard polls about a dozen endpoints every 2 seconds and each one
+# read every job/goal hash with its own Redis round trip, so requests queued
+# up and pages took seconds to fill in. Reads now fetch all matching hashes in
+# one pipelined round trip, shared through a very short snapshot cache.
+_SNAPSHOT_TTL = float(os.environ.get("API_SNAPSHOT_TTL", "1.0"))
+_snapshots = {}
+
+
+def _hashes(pattern):
+    """[(key, data)] for every non-empty hash matching pattern (non-hash keys,
+    like planner locks, are skipped). One round trip; cached _SNAPSHOT_TTL s."""
+    now = time.monotonic()
+    cache_key = (id(redis), pattern)
+    cached = _snapshots.get(cache_key)
+    if cached and now - cached[0] < _SNAPSHOT_TTL:
+        return cached[1]
+    keys = _keys(pattern)
+    try:
+        pipe = redis.pipeline(transaction=False)
+        for key in keys:
+            pipe.hgetall(key)
+        values = pipe.execute(raise_on_error=False)
+    except Exception:
+        values = [_hash(key) for key in keys]
+    result = [(key, value) for key, value in zip(keys, values) if isinstance(value, dict) and value]
+    if _SNAPSHOT_TTL > 0:
+        _snapshots[cache_key] = (now, result)
+    return result
+
+
+def _job_statuses():
+    return {_key_suffix(key): data.get("status") for key, data in _hashes("laika:jobs:*")}
+
+
+def _keys(pattern):
+    try:
+        return sorted(redis.scan_iter(pattern), key=str)
+    except Exception:
+        return []
+
+
+def _limit(value):
+    return max(0, min(int(value), API_MAX_LIMIT))
+
+
+def _page(items, offset, limit):
+    return items[offset:offset + _limit(limit)]
+
+
+def _job_title(data):
+    """A readable one-line title: the planner's title, else the prompt's first line."""
+    title = _text(data.get("title"))
+    if not title:
+        # Only the start: prompts can be thousands of lines (this runs for
+        # every job on every request).
+        head = str(data.get("prompt") or "")[:600]
+        title = next((line.strip() for line in head.splitlines() if line.strip()), "")
+    return title if len(title) <= 140 else title[:137] + "…"
+
+
+def _job(key, data):
+    data = data if isinstance(data, dict) else {}
+    started_at = _float_or_none(data.get("started_at"))
+    finished_at = _float_or_none(data.get("finished_at"))
+    elapsed_seconds = None
+    if started_at is not None:
+        elapsed_seconds = max((finished_at if finished_at is not None else time.time()) - started_at, 0)
+    return {
+        "id": _text(data.get("id"), _key_suffix(key)),
+        "title": _job_title(data),
+        "project_id": _text(data.get("project_id"), "laika"),
+        "goal_id": _text(data.get("goal_id")),
+        "status": _text(data.get("status"), "unknown"),
+        "role": _text(data.get("job_role", data.get("role"))),
+        "worker": _text(data.get("worker_id", data.get("worker"))),
+        "provider": _text(data.get("provider")),
+        "model": _text(data.get("model")),
+        "review_status": _text(data.get("review_status")),
+        "review_verdict": _text(data.get("review_verdict")),
+        "review_job_id": _text(data.get("review_job_id")),
+        "integration_status": _text(data.get("integration_status")),
+        "integration_base_commit": _text(data.get("integration_base_commit")),
+        "integrated_candidate_commit": _text(data.get("integrated_candidate_commit")),
+        "reviewed_commit": _text(data.get("reviewed_commit")),
+        "integration_worktree": _text(data.get("integration_worktree")),
+        "integration_branch": _text(data.get("integration_branch")),
+        "input_tokens": _number(data.get("input_tokens")),
+        "effective_tokens": _effective_tokens(data),
+        "cached_input_tokens": _number(data.get("cached_input_tokens", data.get("cached_tokens"))),
+        "output_tokens": _number(data.get("output_tokens")),
+        "uncached_input_tokens": _number(data.get("uncached_input_tokens")),
+        "command_count": _number(data.get("command_count")),
+        "total_tokens": _number(data.get("total_tokens", data.get("tokens"))),
+        "duration": _duration(data),
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "elapsed_seconds": elapsed_seconds,
+        "branch": _text(data.get("branch")),
+        "base": _text(data.get("integration_base_commit", data.get("base", data.get("base_commit")))),
+        "candidate": _text(data.get("integrated_candidate_commit", data.get("candidate", data.get("candidate_commit")))),
+        "files": _number(data.get("files_changed", data.get("file_count"))),
+        "tests": _text(data.get("test_status", data.get("tests"))),
+        "error": _text(data.get("error", data.get("failure", data.get("failure_reason")))),
+        # Parallel-pipeline state (scope waits, provider routing, best-of,
+        # specialist reviews, merge queue).
+        "blocked_reason": _text(data.get("blocked_reason")),
+        "build_attempt": _number(data.get("build_attempt")),
+        "provider_wait": _text(data.get("provider_wait")),
+        "provider_fallback": _text(data.get("provider_fallback")),
+        "cost_usd": _number(data.get("cost_usd")),
+        "best_of": _json_object(data.get("best_of")),
+        "review_aspects": _json_object(data.get("review_aspects")),
+        "merge_queue_state": _text(data.get("merge_queue_state")),
+        "merge_queue_reason": _text(data.get("merge_queue_reason")),
+        "needs_human_kind": _text(data.get("needs_human_kind")),
+        # An internet-access request (services/network_access.py); credentials already masked.
+        "network_request_reason": _text(data.get("network_request_reason"), "")[:1200],
+        "network_request_step": _text(data.get("network_request_step")),
+        "sort_time": _timestamp(data.get("updated_at", data.get("created_at"))),
+    }
+
+
+def _json_object(value):
+    try:
+        parsed = json.loads(value) if isinstance(value, str) and value else None
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+_derived = {}
+
+
+def _from_snapshot(name, rows, build):
+    """build(rows), reused while the same snapshot is served (see _hashes);
+    callers get copies, so adding fields to one response never leaks."""
+    cached = _derived.get(name)
+    if cached is None or cached[0] is not rows:
+        cached = (rows, build(rows))
+        _derived[name] = cached
+    return [dict(item) for item in cached[1]]
+
+
+def _all_jobs():
+    return _from_snapshot("jobs", _hashes("laika:jobs:*"), lambda rows: sorted(
+        (_job(key, data) for key, data in rows), key=lambda item: (-item["sort_time"], item["id"])))
+
+
+def _goal(key, data):
+    data = data if isinstance(data, dict) else {}
+    statuses = _job_statuses()
+    child_ids = _json_list(data.get("jobs", data.get("job_ids")))
+    counts = {}
+    for child_id in child_ids:
+        status = _text(statuses.get(child_id), "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    counts = dict(sorted(counts.items()))
+    return {
+        "id": _text(data.get("id"), _key_suffix(key)),
+        "project_id": _text(data.get("project_id"), "laika"),
+        "status": _text(data.get("status"), "unknown"),
+        "summary": _bounded_summary(data.get("summary", data.get("text", data.get("goal")))),
+        "prompt": _bounded_summary(data.get("goal", data.get("prompt", data.get("text")))),
+        "created_at": _text(data.get("created_at")),
+        "updated_at": _text(data.get("updated_at")),
+        "child_job_ids": child_ids,
+        "planner_provider": _text(data.get("planner_provider")),
+        "planner_model": _text(data.get("planner_model")),
+        "progress": {
+            "total": len(child_ids),
+            "completed": sum(counts.get(status, 0) for status in JOB_TERMINAL_STATUSES),
+            "status_counts": counts,
+        },
+        "sort_time": _timestamp(data.get("updated_at", data.get("created_at"))),
+    }
+
+
+def _all_goals():
+    return _from_snapshot("goals", _hashes("laika:goals:*"), lambda rows: sorted(
+        (_goal(key, data) for key, data in rows), key=lambda item: (-item["sort_time"], item["id"])))
+
+
+def _worker(key, data, jobs):
+    data = data if isinstance(data, dict) else {}
+    worker_id = _text(data.get("id", data.get("worker_id")), _key_suffix(key))
+    matches = [job for job in jobs if job["worker"] == worker_id]
+    active = [job for job in matches if job["status"] not in JOB_TERMINAL_STATUSES | FAILURE_STATUSES]
+    job = max(active or matches, key=lambda item: (item["sort_time"], item["id"]), default={})
+    active_job = max(active, key=lambda item: (item["sort_time"], item["id"]), default={})
+    job_data = _hash(f"laika:jobs:{job.get('id')}") if job else {}
+    merged = {**data, **job_data}
+    return {
+        "id": worker_id,
+        "role": _text(data.get("role", data.get("job_role")), job.get("role")),
+        # Keep latest-job telemetry, while exposing an unambiguous busy signal.
+        "job_id": _text(data.get("job_id", data.get("current_job_id", data.get("active_job_id"))), job.get("id")),
+        "active_job_id": active_job.get("id"),
+        "status": _text(data.get("status"), job.get("status"),),
+        "provider": _text(data.get("provider"), job.get("provider")),
+        "model": _text(data.get("model"), job.get("model")),
+        "last_seen": _number(data.get("last_seen", data.get("heartbeat"))),
+        "job_started_at": _float_or_none(data.get("job_started_at")),
+        "heartbeat_age": max(int(time.time() - _timestamp(data.get("last_seen", data.get("heartbeat")))), 0) if _timestamp(data.get("last_seen", data.get("heartbeat"))) else None,
+        "effective_tokens": _effective_tokens(merged),
+        "cached_input_tokens": _number(merged.get("cached_input_tokens", merged.get("cached_tokens"))),
+        "command_count": _number(merged.get("command_count")),
+        "duration": _duration(merged),
+    }
+
+
+def _orchestrator(key, data):
+    data = data if isinstance(data, dict) else {}
+    active_goal = _text(data.get("goal_id", data.get("active_goal")))
+    status = _text(data.get("status"), "unknown")
+    if active_goal and status == "idle":
+        status = "active"
+    return {
+        "id": _text(data.get("id"), _key_suffix(key)),
+        "status": status,
+        "provider": _text(data.get("provider")),
+        "model": _text(data.get("model")),
+        "active_goal": active_goal,
+        "last_seen": _number(data.get("last_seen")),
+        "heartbeat_age": max(int(time.time() - _timestamp(data.get("last_seen"))), 0) if _timestamp(data.get("last_seen")) else None,
+    }
+
+
+def _repository():
+    try:
+        value = redis.get("laika:main-head")
+        sha = value.strip() if isinstance(value, str) else ""
+        if sha:
+            return {"branch": "main", "head": sha, "short": sha[:12], "status": "ok"}
+    except Exception:
+        pass
+    return {"branch": "unknown", "head": None, "short": None, "status": "unknown"}
+
+
+@app.get("/")
+def root():
+    return {
+        "name": "LAIka",
+        "version": "0.1.0",
+        "status": "online"
+    }
+
+
+@app.get("/health")
+def health():
+    services = {}
+
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        services["postgres"] = "healthy"
+    except Exception as exc:
+        services["postgres"] = f"error: {exc}"
+
+    try:
+        redis.ping()
+        services["redis"] = "healthy"
+    except Exception as exc:
+        services["redis"] = f"error: {exc}"
+
+    healthy = all(value == "healthy" for value in services.values())
+
+    return {
+        "status": "healthy" if healthy else "degraded",
+        "services": services,
+        # Informational: does not affect "status" (pipeline heartbeats expire
+        # after 30s, so a key's existence means the process is live).
+        "pipeline": _pipeline_health(),
+    }
+
+
+def _pipeline_health():
+    try:
+        workers = list(redis.scan_iter("laika:workers:*"))
+        return {
+            "orchestrators": sum(1 for _ in redis.scan_iter("laika:orchestrators:*")),
+            "operator_service": any(True for _ in redis.scan_iter("laika:operator-service:*")),
+            "workers": len(workers),
+            "workers_busy": sum(1 for key in workers if redis.hget(key, "status") == "working"),
+        }
+    except Exception:
+        return None
+
+
+# Read-only dashboard data. These routes only read Redis hashes/lists and never
+# expose the Redis client or connection details to callers.
+@app.get("/api/status")
+def api_status():
+    jobs = _all_jobs()
+    goals = _all_goals()
+    workers = api_workers()
+    orchestrators = [_orchestrator(key, _hash(key)) for key in _keys("laika:orchestrators:*")]
+    active_ids = {item["active_goal"] for item in orchestrators if item["active_goal"]}
+    active_goal = next((goal for goal in goals if goal["id"] in active_ids), None)
+    if active_goal is None:
+        active_goal = next((goal for goal in goals if goal["status"] in {"active", "running", "in_progress"}), None)
+    try:
+        queue_depth = redis.llen(os.getenv("WORKER_QUEUE", "laika:jobs"))
+    except Exception:
+        queue_depth = None
+    return {
+        "repository": _repository(),
+        "queue": {"name": os.getenv("WORKER_QUEUE", "laika:jobs"), "depth": queue_depth},
+        "orchestrators": orchestrators,
+        "active_goal": active_goal,
+        "workers": workers,
+        "heartbeat": {"workers": workers, "orchestrators": orchestrators},
+        "goals": {"recent": goals[:API_DEFAULT_LIMIT]},
+        "jobs": {"recent": jobs[:API_DEFAULT_LIMIT], "failures": [job for job in jobs if job["status"] in FAILURE_STATUSES][:API_DEFAULT_LIMIT]},
+        "pending_human_approvals": [job for job in jobs if _approval_ready(job)][:API_DEFAULT_LIMIT],
+    }
+
+
+@app.get("/api/repository")
+def api_repository():
+    return _repository()
+
+
+@app.get("/api/queue")
+def api_queue():
+    name = os.getenv("WORKER_QUEUE", "laika:jobs")
+    try:
+        depth = redis.llen(name)
+    except Exception:
+        depth = None
+    return {"name": name, "depth": depth}
+
+
+@app.get("/api/orchestrators")
+def api_orchestrators():
+    return [_orchestrator(key, _hash(key)) for key in _keys("laika:orchestrators:*")]
+
+
+def api_workers():
+    jobs = _all_jobs()
+    return sorted([_worker(key, _hash(key), jobs) for key in _keys("laika:workers:*")], key=lambda item: item["id"])
+
+
+@app.get("/api/workers")
+def get_api_workers():
+    return api_workers()
+
+
+@app.get("/api/heartbeat")
+def api_heartbeat():
+    return {"workers": api_workers(), "orchestrators": api_orchestrators()}
+
+
+@app.get("/api/goals")
+def api_goals(
+    limit: int = Query(API_DEFAULT_LIMIT, ge=0, le=API_MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+):
+    return _page(_all_goals(), offset, limit)
+
+
+@app.get("/api/goals/recent")
+def api_recent_goals(
+    limit: int = Query(API_DEFAULT_LIMIT, ge=0, le=API_MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+):
+    return api_goals(limit, offset)
+
+
+@app.get("/api/jobs")
+def api_jobs(
+    limit: int = Query(API_DEFAULT_LIMIT, ge=0, le=API_MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+):
+    return _page(_all_jobs(), offset, limit)
+
+
+@app.get("/api/jobs/recent")
+def api_recent_jobs(
+    limit: int = Query(API_DEFAULT_LIMIT, ge=0, le=API_MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+):
+    return api_jobs(limit, offset)
+
+
+def _approval_ready(job):
+    """Return whether persisted state is ready for host-side approval validation.
+
+    This deliberately does not inspect Git or host worktrees. The API container
+    has no repository authority. scripts/job-review.py is the authoritative
+    final gate for main freshness, repository cleanliness, worktree state,
+    branch state, and the merge itself.
+    """
+    if (
+        job.get("status") != "awaiting_review"
+        or job.get("review_status") != "complete"
+        or job.get("review_verdict") != "pass"
+        or job.get("integration_status") != "passed"
+    ):
+        return False
+
+    review_job_id = job.get("review_job_id")
+    integrated_commit = job.get("integrated_candidate_commit")
+    base_commit = job.get("integration_base_commit")
+
+    if not all((review_job_id, integrated_commit, base_commit)):
+        return False
+
+    if job.get("reviewed_commit") != integrated_commit:
+        return False
+
+    review = _hash(f"laika:jobs:{review_job_id}")
+    if (
+        not review
+        or review.get("role") != "reviewer"
+        or review.get("builder_job_id") != job.get("id")
+        or review.get("status") != "review_complete"
+        or review.get("review_verdict") != "pass"
+        or review.get("candidate_commit") != integrated_commit
+        or review.get("reviewed_commit") != integrated_commit
+    ):
+        return False
+
+    return True
+
+
+@app.get("/api/approvals")
+def api_approvals(limit: int = Query(API_DEFAULT_LIMIT, ge=0, le=API_MAX_LIMIT)):
+    import preview_routes
+    approvals = [job for job in _all_jobs() if _approval_ready(job)][:_limit(limit)]
+    for job in approvals:
+        job["previewable"] = preview_routes.previewable(job)
+        job["preview"] = preview_routes.preview_status(job["id"])
+    return approvals
+
+
+@app.get("/api/jobs/approvals")
+def api_job_approvals(limit: int = Query(API_DEFAULT_LIMIT, ge=0, le=API_MAX_LIMIT)):
+    return api_approvals(limit)
+
+
+@app.get("/api/failures")
+def api_failures(limit: int = Query(API_DEFAULT_LIMIT, ge=0, le=API_MAX_LIMIT)):
+    return [job for job in _all_jobs() if job["status"] in FAILURE_STATUSES][:_limit(limit)]
+
+
+_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_BUSY_WORKER_STATUSES = {"working", "busy", "claimed", "running", "active", "stopping"}
+_REDACT_KEY = re.compile(
+    r"(?:password|passwd|secret|credential|api.?key|private.?key|authorization|cookie|"
+    r"(?:api|access|refresh|id|auth|bearer|session)[_-]?token|(?<![A-Za-z0-9_])token(?![A-Za-z0-9_]))",
+    re.I,
+)
+_REDACT_VALUE = re.compile(
+    r"(?is)(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,}|"
+    r"AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{8,}|"
+    r"Bearer\s+[A-Za-z0-9._~+/=-]{8,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|"
+    r"(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_-])*"
+    r"(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|authorization|cookie)"
+    r"(?:[_-][A-Za-z0-9]+)*"
+    r"\s*[:=]\s*(?:[^\s,;]+|\"[^\"]*\"|'[^']*')|"
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----)"
+)
+
+
+def _valid_identifier(value, label="identifier"):
+    value = _text(value)
+    if not value or not _IDENTIFIER.fullmatch(value):
+        raise HTTPException(status_code=422, detail=f"Invalid {label}")
+    return value
+
+
+@app.get("/api/dismissals")
+def api_dismissals():
+    values = redis.smembers("laika:dismissed")
+    return {"ids": sorted(value.decode() if isinstance(value, bytes) else str(value) for value in values)}
+
+
+@app.post("/api/dismissals")
+def add_dismissals(payload: DismissalsRequest):
+    ids = []
+    seen = set()
+    for value in payload.ids:
+        if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
+            raise HTTPException(status_code=422, detail="Invalid dismissal id")
+        if value not in seen:
+            seen.add(value)
+            ids.append(value)
+    added = [item_id for item_id in ids if redis.sadd("laika:dismissed", item_id) == 1]
+    return {"ids": added, "total": redis.scard("laika:dismissed")}
+
+
+@app.delete("/api/dismissals/{item_id:path}")
+def remove_dismissal(item_id: str):
+    _valid_identifier(item_id, "dismissal id")
+    return {"id": item_id, "removed": redis.srem("laika:dismissed", item_id) == 1}
+
+
+def _goal_record(goal_id):
+    key = f"laika:goals:{_valid_identifier(goal_id, 'goal id')}"
+    data = _hash(key)
+    if not data:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    return key, data
+
+
+def _job_record(job_id):
+    key = f"laika:jobs:{_valid_identifier(job_id, 'job id')}"
+    data = _hash(key)
+    if not data:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return key, data
+
+
+def _submit_goal(payload, project_id=None):
+    goal = " ".join(payload.goal.split())
+    if not goal:
+        raise HTTPException(status_code=422, detail="Goal cannot be blank")
+    request_id = _text(payload.request_id)
+    if request_id:
+        _valid_identifier(request_id, "request id")
+        marker = f"laika:goal-requests:{request_id}"
+        try:
+            if not redis.set(marker, "reserved", nx=True, ex=86400):
+                existing = redis.get(marker)
+                if existing and existing != "reserved":
+                    existing_goal = _hash(f"laika:goals:{existing}")
+                    existing_atomic = str(
+                        existing_goal.get("atomic", "false")
+                    ).lower() in {"1", "true", "yes"}
+                    if existing_atomic != bool(payload.atomic):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Request id already belongs to a goal with a different atomic mode",
+                        )
+                    return {
+                        "id": existing,
+                        "status": "accepted",
+                        "atomic": existing_atomic,
+                        "duplicate": True,
+                    }
+                raise HTTPException(status_code=409, detail="A goal with this request id is already being submitted")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    # A small duplicate guard for clients that omit request_id. Atomic and
+    # non-atomic submissions are intentionally distinct workflows.
+    for key in _keys("laika:goals:*"):
+        old = _hash(key)
+        old_atomic = str(old.get("atomic", "false")).lower() in {"1", "true", "yes"}
+        if (
+            old.get("goal") == goal
+            and old.get("status") in {"queued", "planning", "running"}
+            and old_atomic == bool(payload.atomic)
+            # The same prompt in another project is different work.
+            and (old.get("project_id") or "laika") == (project_id or "laika")
+        ):
+            return {"id": _text(old.get("id"), _key_suffix(key)), "status": old.get("status"), "atomic": old_atomic, "duplicate": True}
+
+    goal_id = uuid.uuid4().hex[:12]
+    record = {
+        "id": goal_id, "goal": goal, "prompt": goal,
+        "status": "queued", "atomic": str(bool(payload.atomic)).lower(),
+        "created_at": str(time.time()), "updated_at": str(time.time()),
+    }
+    if project_id is not None:
+        record["project_id"] = project_id
+    redis.hset(f"laika:goals:{goal_id}", mapping=record)
+    try:
+        queued = {"id": goal_id, "goal": goal, "atomic": payload.atomic}
+        if project_id is not None:
+            queued["project_id"] = project_id
+        redis.rpush(os.getenv("GOAL_QUEUE", "laika:goals"), json.dumps(queued))
+    except Exception:
+        redis.hset(f"laika:goals:{goal_id}", mapping={"status": "queue_failed", "updated_at": str(time.time())})
+        if request_id:
+            try:
+                marker = f"laika:goal-requests:{request_id}"
+                if redis.get(marker) == "reserved":
+                    redis.delete(marker)
+            except Exception:
+                pass
+        raise HTTPException(status_code=503, detail="Goal queue is unavailable")
+    if request_id:
+        try:
+            redis.set(f"laika:goal-requests:{request_id}", goal_id, ex=86400)
+        except Exception:
+            pass
+    result = {"id": goal_id, "status": "accepted", "atomic": bool(payload.atomic)}
+    if project_id is not None:
+        result["project_id"] = project_id
+    return result
+
+
+@app.post("/api/goals", response_model=GoalAccepted, status_code=202)
+def submit_goal(payload: GoalSubmit):
+    return _submit_goal(payload)
+
+
+@app.post("/api/goals/submit", response_model=GoalAccepted, status_code=202)
+def submit_goal_compat(payload: GoalSubmit):
+    return _submit_goal(payload)
+
+
+@app.post("/api/goals/submit-atomic", response_model=GoalAccepted, status_code=202)
+def submit_atomic_goal(payload: GoalSubmit):
+    return _submit_goal(payload.model_copy(update={"atomic": True}))
+
+
+@app.post("/api/prompts", response_model=GoalAccepted, status_code=202)
+def submit_prompt(payload: PromptSubmit):
+    return _submit_goal(GoalSubmit(
+        goal=payload.prompt,
+        atomic=payload.atomic,
+        request_id=payload.request_id,
+    ))
+
+
+@app.get("/api/goals/{goal_id}")
+def get_goal_detail(goal_id: str):
+    key, data = _goal_record(goal_id)
+    result = _goal(key, data)
+    result["atomic"] = str(data.get("atomic", "false")).lower() in {"1", "true", "yes"}
+    result["jobs"] = [_job(f"laika:jobs:{job_id}", _hash(f"laika:jobs:{job_id}")) for job_id in result["child_job_ids"] if _hash(f"laika:jobs:{job_id}")]
+    return result
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job_detail(job_id: str):
+    key, data = _job_record(job_id)
+    result = _job(key, data)
+    # Detail-only fields: bounded text that is too large for list views.
+    for field in ("review_findings", "needs_human_reason", "repair_status",
+                  "integration_error", "title"):
+        result[field] = _text(data.get(field))
+    for field in ("repair_attempts", "max_repair_attempts"):
+        result[field] = _number(data.get(field))
+    result["lineage"] = _job_lineage(data)
+    result["gate"] = _job_gate(data)
+    result["related"] = _related_jobs(_text(data.get("id"), _key_suffix(key)))
+    return _redact(result)
+
+
+def _json_value(value, expected):
+    """Parse a JSON field written by workers; None if absent or malformed."""
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, expected) else None
+
+
+def _job_lineage(data):
+    """How a job got to its current state: attempts, sources, prior findings."""
+    lineage = {field: _number(data.get(field)) for field in (
+        "build_attempt", "max_build_attempts", "review_recoveries")}
+    lineage.update({field: _text(data.get(field)) for field in (
+        "retry_reason", "needs_human_kind", "repair_job_id",
+        "last_repair_job_id", "last_integrate_job_id")})
+    # Order matters: sources are cherry-picked in this order.
+    lineage["source_candidate_commits"] = [
+        str(item).strip()
+        for item in _json_value(data.get("source_candidate_commits"), list) or []
+        if isinstance(item, str) and item.strip()
+    ]
+    lineage["review_findings_history"] = [
+        {field: _text(item.get(field)) for field in ("review_job_id", "candidate", "findings")}
+        for item in _json_value(data.get("review_findings_history"), list) or []
+        if isinstance(item, dict)
+    ]
+    return lineage
+
+
+def _job_gate(data):
+    gate = _json_value(data.get("integration_result"), dict)
+    if gate is None:
+        return None
+    return {
+        "returncode": _number(gate.get("returncode")),
+        "summary": str(gate.get("stdout") or "")[-3000:],
+    }
+
+
+def _related_jobs(job_id):
+    """Reviewer, repair and integrate jobs that acted on this job."""
+    related = []
+    for key in _keys("laika:jobs:*"):
+        data = _hash(key)
+        if job_id not in (data.get("builder_job_id"), data.get("target_builder_id")):
+            continue
+        related.append({
+            "id": _text(data.get("id"), _key_suffix(key)),
+            "role": _text(data.get("job_role", data.get("role"))),
+            "status": _text(data.get("status"), "unknown"),
+            "review_verdict": _text(data.get("review_verdict")),
+            "duration": _duration(data),
+            "effective_tokens": _effective_tokens(data),
+            "created_at": _timestamp(data.get("created_at")),
+        })
+    return sorted(related, key=lambda job: (job["created_at"], job["id"]))
+
+
+@app.get("/api/action-required")
+@app.get("/api/actions-required")
+def api_action_required(limit: int = Query(API_DEFAULT_LIMIT, ge=0, le=API_MAX_LIMIT)):
+    jobs = _all_jobs()
+    items = [job for job in jobs if (
+        job["status"] in FAILURE_STATUSES or
+        job["status"] in {"awaiting_review", "needs_human"} or
+        job["review_status"] in {"changes_required", "failed"}
+    )]
+    return items[:_limit(limit)]
+
+
+@app.get("/api/agents/activity")
+@app.get("/api/agent-activity")
+def api_agent_activity(limit: int = Query(API_DEFAULT_LIMIT, ge=0, le=API_MAX_LIMIT)):
+    return [job for job in _all_jobs() if job["worker"] or job["role"]][: _limit(limit)]
+
+
+def _worker_record(worker_id):
+    worker_id = _valid_identifier(worker_id, "worker id")
+    key = f"laika:workers:{worker_id}"
+    data = _hash(key)
+    if not data:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    return key, data
+
+
+@app.post("/api/workers/{worker_id}/stop")
+def stop_worker(worker_id: str, action: WorkerAction | None = None):
+    key, data = _worker_record(worker_id)
+    jobs = _all_jobs()
+    active = [job for job in jobs if job["worker"] == worker_id and job["status"] not in JOB_TERMINAL_STATUSES | FAILURE_STATUSES]
+    if active:
+        raise HTTPException(status_code=409, detail="Worker is busy; it cannot be stopped")
+    # The worker process reads this control key between jobs; writing the
+    # heartbeat hash alone was overwritten by the next heartbeat.
+    redis.set(f"laika:worker-control:{worker_id}", "disabled")
+    redis.hset(key, mapping={"status": "disabled", "stop_reason": _text(action.reason if action else None, "requested"), "updated_at": str(time.time())})
+    return _worker(key, {**data, "status": "disabled"}, jobs)
+
+
+@app.delete("/api/workers/{worker_id}")
+def remove_worker(worker_id: str):
+    key, data = _worker_record(worker_id)
+    jobs = _all_jobs()
+    active = [job for job in jobs if job["worker"] == worker_id and job["status"] not in JOB_TERMINAL_STATUSES | FAILURE_STATUSES]
+    if active or _text(data.get("status")).lower() in _BUSY_WORKER_STATUSES:
+        raise HTTPException(status_code=409, detail="Busy worker cannot be removed")
+    redis.delete(key)
+    return {"id": worker_id, "removed": True}
+
+
+@app.post("/api/workers/{worker_id}/start")
+def start_worker(worker_id: str):
+    key, data = _worker_record(worker_id)
+    if _text(data.get("status")).lower() in _BUSY_WORKER_STATUSES:
+        raise HTTPException(status_code=409, detail="Worker is already active")
+    redis.delete(f"laika:worker-control:{worker_id}")
+    redis.hset(key, mapping={"status": "idle", "updated_at": str(time.time())})
+    return _worker(key, {**data, "status": "idle"}, _all_jobs())
+
+
+
+@app.get("/api/system-health")
+def api_system_health():
+    """The host watchdog's latest report (scripts/laika-watchdog.py, every 2 min)
+    plus the last backup record. Read-only; stale when the watchdog stops."""
+    def load(key):
+        try:
+            value = json.loads(redis.get(key) or "null")
+        except Exception:
+            return None
+        return value if isinstance(value, dict) else None
+
+    report = load("laika:health")
+    if report is not None:
+        checked = _number(report.get("checked_at"))
+        report["age_seconds"] = round(time.time() - checked) if checked else None
+    return {"report": report, "backup": load("laika:backup:last")}
+
+
+@app.get("/api/providers")
+def api_providers():
+    """Claude capacity (shared slots, cooldown) and per-role routing as the
+    workers report it. Read-only; the workers own the semaphore."""
+    now_ts = time.time()
+    try:
+        slots = redis.zrangebyscore("laika:provider-slots:claude", now_ts, "+inf", withscores=True)
+        limit = redis.get("laika:provider-limit:claude")
+        cooldown = redis.get("laika:provider-cooldown:claude")
+        cooldown_ttl = redis.ttl("laika:provider-cooldown:claude") if cooldown else None
+    except Exception:
+        slots, limit, cooldown, cooldown_ttl = [], None, None, None
+    routing = next((_text(_hash(key).get("model")) for key in _keys("laika:workers:*")
+                    if _text(_hash(key).get("provider")) == "per role"), None)
+    return {
+        "claude": {
+            "limit": _number(limit),
+            "in_use": [{"holder": _text(holder), "lease_expires": _number(score)} for holder, score in slots],
+            "cooling_down": bool(cooldown),
+            "cooldown_reason": _text(cooldown),
+            "cooldown_seconds_left": cooldown_ttl if cooldown_ttl and cooldown_ttl > 0 else None,
+        },
+        "routing": routing,
+    }
+
+
+@app.get("/api/merge-queue")
+def api_merge_queue():
+    """Queued approvals in merge order, with the state the operator service
+    last recorded (it has the repository; the API does not)."""
+    try:
+        ids = redis.lrange("laika:merge-queue", 0, -1)
+        main_head = redis.get("laika:main-head") or ""
+    except Exception:
+        ids, main_head = [], ""
+    items = []
+    for position, job_id in enumerate(ids, start=1):
+        data = _hash(f"laika:jobs:{job_id}")
+        items.append({
+            "position": position,
+            "id": _text(job_id),
+            "title": _text(data.get("title")),
+            "status": _text(data.get("status"), "unknown"),
+            "state": _text(data.get("merge_queue_state"), "queued"),
+            "reason": _text(data.get("merge_queue_reason"), ""),
+            "approved_candidate": _text(data.get("approval_intent_candidate")),
+            "candidate": _text(data.get("integrated_candidate_commit")),
+            "fresh": bool(main_head) and data.get("integration_base_commit") == main_head,
+            "approved_at": _timestamp(data.get("approval_intent_at")),
+        })
+    return {"main_head": main_head or None, "items": items}
+
+
+# Operator actions. The API has no repository authority (no git, no
+# shell): it records a request and the host-side operator service
+# (services/operator/laika_operator.py) validates and executes it with
+# scripts/job-review.py. Nothing here writes job state.
+OPERATOR_STREAM = "laika:operator-requests"
+OPERATOR_STREAM_MAXLEN = 10000
+OPERATOR_REQUEST_FIELDS = ("request_id", "job_id", "action", "expected_status", "expected_candidate", "extra")
+_OPERATOR_JOB_ID = re.compile(r"^[A-Za-z0-9]{1,64}$")
+_OPERATOR_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$")
+
+
+def _operator_service():
+    """The live operator heartbeat (30s TTL), or None when offline."""
+    for key in _keys("laika:operator-service:*"):
+        data = _hash(key)
+        if data:
+            return data
+    return None
+
+
+def _operator_result(data):
+    return _redact({field: _text(data.get(field), "") for field in (
+        *OPERATOR_REQUEST_FIELDS, "status", "message", "output",
+        "requested_from", "created_at", "started_at", "finished_at",
+    )})
+
+
+@app.get("/api/auth")
+def auth_status(request: Request):
+    """Whether writes need a token, and whether the caller's token is valid."""
+    return {"token_required": bool(OPERATOR_TOKEN), "token_valid": _token_ok(request)}
+
+
+@app.get("/api/operator/status")
+def operator_status():
+    service = _operator_service()
+    if not service:
+        return {"online": False, "allowed_actions": []}
+    return {
+        "online": True,
+        "id": _text(service.get("id")),
+        "status": _text(service.get("status")),
+        "allowed_actions": [a for a in _text(service.get("allowed_actions"), "").split(",") if a],
+        "request_ttl": _number(service.get("request_ttl")),
+        "last_seen": _timestamp(service.get("last_seen")),
+    }
+
+
+@app.post("/api/jobs/{job_id}/actions", status_code=202)
+def request_job_action(job_id: str, payload: OperatorActionRequest, request: Request, response: Response):
+    if not _OPERATOR_JOB_ID.fullmatch(job_id):
+        raise HTTPException(status_code=422, detail="Invalid job id")
+    import device_routes
+    device = getattr(request.state, "device", None)
+    if device is not None and not _token_ok(request) and payload.action not in device_routes.DEVICE_JOB_ACTIONS:
+        raise HTTPException(status_code=403, detail="Approvals are made on the dashboard, not from a device")
+    fields = {
+        "request_id": payload.request_id,
+        "job_id": job_id,
+        "action": payload.action,
+        "expected_status": payload.expected_status,
+        "expected_candidate": payload.expected_candidate or "",
+        "extra": str(payload.extra) if payload.extra is not None else "",
+    }
+    key = f"laika:operator-results:{payload.request_id}"
+
+    # A retried request (same id) returns its existing result, never a
+    # second execution. The same id for a different action is a conflict.
+    existing = _hash(key)
+    if existing:
+        if any(_text(existing.get(f), "") != fields[f] for f in OPERATOR_REQUEST_FIELDS):
+            raise HTTPException(status_code=409, detail="Request id already used for a different request")
+        response.status_code = 200
+        return _operator_result(existing)
+
+    service = _operator_service()
+    if not service:
+        raise HTTPException(status_code=503, detail="Operator service is offline; use scripts/job-review.py on the host")
+    allowed = _text(service.get("allowed_actions"), "").split(",")
+    if payload.action not in allowed:
+        raise HTTPException(status_code=403, detail=f"Action {payload.action} is disabled on the host (OPERATOR_ALLOWED_ACTIONS)")
+    # Advancing main from the Web is never accepted from an open API, even
+    # if the host enabled it.
+    if payload.action in ("approve", "queue_approve") and not OPERATOR_TOKEN:
+        raise HTTPException(status_code=403, detail="Web approval requires LAIKA_OPERATOR_TOKEN on the API")
+
+    # Early feedback only; the operator service re-checks at execution time.
+    _, job = _job_record(job_id)
+    if _text(job.get("status"), "") != payload.expected_status:
+        raise HTTPException(status_code=409, detail=f"Job status is now {job.get('status')!r}; refresh and decide again")
+
+    if not redis.hsetnx(key, "request_id", payload.request_id):
+        raise HTTPException(status_code=409, detail="A request with this id is already being submitted")
+    # Audit only: forwarded headers are client-controlled without auth.
+    requested_from = request.headers.get("x-real-ip") or (request.client.host if request.client else "")
+    if device is not None:
+        requested_from = f"device {device.get('name')} ({device.get('id')}) {requested_from}".strip()
+    now = str(time.time())
+    redis.hset(key, mapping={**fields, "status": "pending", "requested_from": requested_from, "created_at": now})
+    try:
+        redis.xadd(OPERATOR_STREAM, {**fields, "requested_from": requested_from},
+                   maxlen=OPERATOR_STREAM_MAXLEN, approximate=True)
+    except Exception:
+        redis.hset(key, mapping={"status": "queue_failed", "message": "operator request stream is unavailable"})
+        raise HTTPException(status_code=503, detail="Operator request stream is unavailable")
+    return _operator_result(_hash(key))
+
+
+@app.get("/api/operator-requests/{request_id}")
+def get_operator_request(request_id: str):
+    if not _OPERATOR_REQUEST_ID.fullmatch(request_id):
+        raise HTTPException(status_code=422, detail="Invalid request id")
+    data = _hash(f"laika:operator-results:{request_id}")
+    if not data:
+        raise HTTPException(status_code=404, detail="Operator request not found")
+    return _operator_result(data)
+
+def _redact(value, key=""):
+    if _REDACT_KEY.search(key):
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {str(k): _redact(v, str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(item, key) for item in value]
+    if isinstance(value, str):
+        return _REDACT_VALUE.sub("[REDACTED]", value)
+    return value
+
+
+@app.get("/api/goals/{goal_id}/handoff")
+@app.get("/api/goals/{goal_id}/handoff-bundle")
+@app.get("/api/handoff/{goal_id}")
+def download_handoff(goal_id: str):
+    detail = get_goal_detail(goal_id)
+    bundle = {
+        "bundle_type": "PRE-MERGE REVIEW",
+        "goal": detail,
+        "repository": _repository(),
+        "generated_at": time.time(),
+    }
+    content = json.dumps(_redact(bundle), indent=2, sort_keys=True).encode()
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+        output.writestr("PRE-MERGE REVIEW.json", content)
+    archive.seek(0)
+    return StreamingResponse(archive, media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="handoff-{_valid_identifier(goal_id, "goal id")}.zip"'})
+
+
+@app.get("/api/goals/{goal_id}/handoff-data")
+def handoff_data(goal_id: str):
+    detail = get_goal_detail(goal_id)
+    return _redact({
+        "bundle_type": "PRE-MERGE REVIEW",
+        "goal": detail,
+        "repository": _repository(),
+    })
+
+
+@app.on_event("startup")
+def startup():
+    init_database()
+
+
+# ---------------------------------------------------------------------------
+# Projects / Tasks API
+# ---------------------------------------------------------------------------
+
+from fastapi import Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from database import SessionLocal
+from models import Project, Task
+from schemas import (
+    ProjectCreate,
+    ProjectResponse,
+    TaskCreate,
+    TaskResponse,
+    WorkerAction,
+)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@app.post("/projects", response_model=ProjectResponse)
+def create_project(project: ProjectCreate, db: Session = Depends(get_db)):
+    record = Project(**project.model_dump())
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+@app.get("/projects", response_model=list[ProjectResponse])
+def list_projects(db: Session = Depends(get_db)):
+    return db.query(Project).order_by(Project.id.desc()).all()
+
+
+@app.get("/projects/{project_id}", response_model=ProjectResponse)
+def get_project(project_id: int, db: Session = Depends(get_db)):
+    record = db.get(Project, project_id)
+
+    if not record:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    return record
+
+
+@app.post("/tasks", response_model=TaskResponse)
+def create_task(task: TaskCreate, db: Session = Depends(get_db)):
+    project = db.get(Project, task.project_id)
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    record = Task(**task.model_dump())
+
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+
+    return record
+
+
+@app.get("/tasks", response_model=list[TaskResponse])
+def list_tasks(db: Session = Depends(get_db)):
+    return db.query(Task).order_by(Task.priority.desc(), Task.id.asc()).all()
+
+
+@app.get("/projects/{project_id}/tasks", response_model=list[TaskResponse])
+def project_tasks(project_id: int, db: Session = Depends(get_db)):
+    project = db.get(Project, project_id)
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    return (
+        db.query(Task)
+        .filter(Task.project_id == project_id)
+        .order_by(Task.priority.desc(), Task.id.asc())
+        .all()
+    )
+
+
+# Provider inspection and persistent agent definitions (execution is internal only).
+from agent_routes import router as agent_router
+from project_routes import router as project_router
+from file_routes import router as file_router
+from env_routes import router as env_router
+from log_routes import router as log_router
+from usage_routes import router as usage_router
+from preview_routes import router as preview_router
+from activity_routes import router as activity_router
+from notify_routes import router as notify_router
+from build_routes import router as build_router
+from device_routes import router as device_router
+from settings_routes import router as settings_router
+from auth import router as auth_router
+from provider_routes import router as provider_router
+from scale_routes import router as scale_router
+from group_routes import router as group_router
+from system_routes import router as system_router
+from assist_routes import router as assist_router
+
+app.include_router(agent_router)
+app.include_router(project_router)
+app.include_router(file_router)
+app.include_router(env_router)
+app.include_router(log_router)
+app.include_router(usage_router)
+app.include_router(preview_router)
+app.include_router(activity_router)
+app.include_router(notify_router)
+app.include_router(build_router)
+app.include_router(device_router)
+app.include_router(settings_router)
+app.include_router(auth_router)
+app.include_router(provider_router)
+app.include_router(scale_router)
+app.include_router(group_router)
+app.include_router(system_router)
+app.include_router(assist_router)

@@ -1,0 +1,23 @@
+// One import per feature module. Each module registers itself with
+// lib/registry.js; adding a feature means adding a file and one line here.
+import './appearance.js';
+import './brand.js';
+import './auth.js';
+import './setup-wizard.js';
+import './worker-scale.js';
+import './merge-queue.js';
+import './pipeline-insights.js';
+import './providers.js';
+import './system-health.js';
+import './projects.js';
+import './project-kinds.js';
+import './project-overview.js';
+import './project-wizard.js';
+import './project-files.js';
+import './job-log.js';
+import './usage.js';
+import './previews.js';
+import './home.js';
+import './settings.js';
+import './devices.js';
+import './elapsed.js';

@@ -1,0 +1,2311 @@
+import json
+import os
+import pwd
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+
+from redis import Redis
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import laika_env  # noqa: E402,F401  (Settings → environment, before any configuration is read)
+import agent_cli  # noqa: E402  (services/agent_cli.py)
+import network_access  # noqa: E402  (services/network_access.py)
+import project_reference  # noqa: E402  (services/project_reference.py)
+import laika_projects  # noqa: E402  (services/laika_projects.py)
+import project_sandbox  # noqa: E402  (services/project_sandbox.py)
+import laika_redis  # noqa: E402  (services/laika_redis.py)
+
+REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+QUEUE_NAME = os.environ.get("WORKER_QUEUE", "laika:jobs")
+REPO_ROOT = Path(os.environ.get("REPO_ROOT", "/opt/laika"))
+WORKTREE_ROOT = Path(os.environ.get("WORKTREE_ROOT", "/var/lib/laika/worktrees"))
+LOG_ROOT = Path(os.environ.get("LOG_ROOT", "/var/log/laika/jobs"))
+
+WORKER_ID = os.environ.get("WORKER_ID", f"{socket.gethostname()}-{os.getpid()}")
+WORKER_ROLE = os.environ.get("WORKER_ROLE", "builder")
+DEFAULT_PROVIDER = os.environ.get("DEFAULT_PROVIDER", "codex")
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "gpt-5.6-luna")
+
+MAX_RUNTIME = int(os.environ.get("MAX_JOB_RUNTIME", "1800"))
+ROLE_RUNTIME_DEFAULTS = {"builder": 600, "reviewer": 240, "repair": 360}
+ROLE_TOKEN_DEFAULTS = {"builder": 100000, "reviewer": 75000, "repair": 100000}
+ROLE_ENFORCEMENT_DEFAULTS = {"builder": 100000, "reviewer": 60000, "repair": 80000}
+POLL_SECONDS = int(os.environ.get("CODEX_POLL_SECONDS", "2"))
+HEARTBEAT_SECONDS = int(os.environ.get("HEARTBEAT_SECONDS", "10"))
+REVIEW_DIFF_CHARS = int(os.environ.get("REVIEW_DIFF_CHARS", "60000"))
+REVIEW_GATE_CHARS = int(os.environ.get("REVIEW_GATE_CHARS", "3000"))
+REVIEW_PRIOR_CHARS = int(os.environ.get("REVIEW_PRIOR_CHARS", "4000"))
+FINDINGS_CHARS = 6000
+
+
+def resolve_laika_python():
+    """Python used for LAIka test gates.
+
+    /tmp is cleared on reboot, so the durable default is /var/lib/laika/venv.
+    The legacy /tmp location is only used when nothing else is configured.
+    """
+    configured = os.environ.get("LAIKA_PYTHON")
+    if configured:
+        return configured
+    durable = Path("/var/lib/laika/venv/bin/python")
+    if durable.exists():
+        return str(durable)
+    return "/tmp/laika-agent-venv/bin/python"
+
+
+LAIKA_PYTHON = resolve_laika_python()
+
+
+def role_limit(role, kind, defaults):
+    name = f"{role.upper()}_{kind}"
+    return int(os.environ.get(name, str(defaults[role])))
+
+
+def efficiency_prefix(role):
+    return f"""LAIka execution contract ({role}):
+- Work narrowly on the requested task. Do not inventory or read the whole repository.
+- Start with git status/diff and targeted rg/sed reads of likely files only.
+- Expand scope only when a concrete dependency requires it.
+- Do not run broad test suites; LAIka runs deterministic gates after builders/repairs.
+- For focused Python tests, use {LAIKA_PYTHON} -m pytest; do not probe python/pytest executables.
+- Avoid repeated reads and verbose narration. Make the smallest correct change/review.
+- Stop as soon as the task and focused validation are complete.
+{network_access.PROMPT_NOTE if role in ("builder", "repair") and PROJECT is not None and not PROJECT.is_builtin else ""}{GROUP_NOTE}
+"""
+
+redis = Redis.from_url(REDIS_URL, password=laika_redis.password(), decode_responses=True)
+
+# The job this process is working on, published in every heartbeat. The
+# orchestrator treats work as in flight only while a live worker holds it
+# (or it is still queued), which is how it detects jobs orphaned by a
+# worker restart or crash.
+CURRENT_JOB_ID = ""
+CURRENT_JOB_STARTED_AT = ""
+# Role, provider and model of the held job, published in the heartbeat so the
+# dashboard shows what is actually running (any worker takes any role).
+CURRENT_JOB_ROLE = ""
+CURRENT_AGENT = {}
+
+
+def worker_key():
+    return f"laika:workers:{WORKER_ID}"
+
+
+def control_key(worker_id=None):
+    # Operator control lives outside the heartbeat hash so that heartbeats
+    # can never overwrite a stop request.
+    return f"laika:worker-control:{worker_id or WORKER_ID}"
+
+
+def worker_disabled():
+    try:
+        return redis.get(control_key()) == "disabled"
+    except Exception:
+        return False
+
+
+def pause_reason():
+    """Why this worker must not claim a new job now, or None: the operator
+    stopped it ("disabled"), the scaler is removing it ("draining",
+    laika:worker-drain:<id>), or memory is critical ("held",
+    laika:scaler:hold; see services/scaler/laika_scaler.py)."""
+    if worker_disabled():
+        return "disabled"
+    try:
+        if redis.get(f"laika:worker-drain:{WORKER_ID}"):
+            return "draining"
+        if redis.get("laika:scaler:hold"):
+            return "held"
+    except Exception:
+        pass
+    return None
+
+
+def heartbeat(status="idle"):
+    if status == "idle":
+        # The scaler stops a draining worker once it reports "draining"
+        # with no job: written only here, between jobs, after the check.
+        status = pause_reason() or "idle"
+    redis.hset(
+        worker_key(),
+        mapping={
+            "id": WORKER_ID,
+            "role": CURRENT_JOB_ROLE or "any",
+            "worker_class": WORKER_CLASS,
+            "provider": CURRENT_AGENT.get("provider") or "per role",
+            "model": CURRENT_AGENT.get("model") or agent_cli.routing_summary(DEFAULT_MODEL),
+            "status": status,
+            "job_id": CURRENT_JOB_ID,
+            "job_started_at": CURRENT_JOB_STARTED_AT,
+            "last_seen": str(time.time()),
+        },
+    )
+    redis.expire(worker_key(), 30)
+
+
+@contextmanager
+def keep_alive(status="working"):
+    """Heartbeat in the background during long steps (tests, integration).
+
+    Without this the 30s heartbeat key expires while a busy worker runs its
+    test gate, and the worker vanishes from every dashboard.
+    """
+    stop = threading.Event()
+
+    def beat():
+        while not stop.wait(HEARTBEAT_SECONDS):
+            try:
+                heartbeat(status)
+            except Exception as exc:
+                print(f"[{WORKER_ID}] heartbeat warning: {exc}", flush=True)
+
+    thread = threading.Thread(target=beat, name="laika-heartbeat", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=HEARTBEAT_SECONDS + 1)
+
+
+def check_worktree_pointer(cwd):
+    """Refuse to run host git inside a project worktree whose .git pointer is
+    not the one git created (laika_projects.verify_worktree_pointer)."""
+    if PROJECT is None or PROJECT.is_builtin or cwd is None:
+        return
+    root = Path(WORKTREE_ROOT).resolve()
+    path = Path(cwd).resolve()
+    if path == root or root not in path.parents:
+        return
+    top = root / path.relative_to(root).parts[0]
+    if not os.path.lexists(top / ".git") and not top.exists():
+        return
+    laika_projects.verify_worktree_pointer(top, REPO_ROOT)
+
+
+def agent_sandbox(worktree):
+    """argv wrapper that runs an agent CLI in the project sandbox (LAIka: none)."""
+    return lambda argv: project_sandbox.command(argv, PROJECT, worktree, kind="agent")
+
+
+def run_git(*args, cwd=None, check=True):
+    check_worktree_pointer(cwd)
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd or REPO_ROOT,  # resolved per call: the current job's project
+        text=True,
+        capture_output=True,
+        check=check,
+    )
+
+
+# The project the current job belongs to. A worker runs one job at a time,
+# so the repository, worktree and log roots are switched per job.
+PROJECT = None
+
+
+# The current job's project group: read-only copies of the other members
+# (services/project_reference.py) and the prompt note naming them.
+GROUP_NOTE = ""
+
+
+def prepare_group_context():
+    """For a job in a project group: refresh the other members' read-only
+    copies, tell the agents about them and let Claude read them."""
+    global GROUP_NOTE
+    GROUP_NOTE = ""
+    agent_cli.EXTRA_DIRS = []
+    if PROJECT is None:
+        return
+    try:
+        head = laika_projects.load(redis, PROJECT.parent) if PROJECT.parent else PROJECT
+        members = laika_projects.group(redis, head)
+        if len(members) < 2:
+            return
+        copies = project_reference.prepare(PROJECT, members)
+    except Exception as exc:  # never fail a job over its context
+        print(f"[{WORKER_ID}] group context for {PROJECT.id}: {exc}", flush=True)
+        return
+    GROUP_NOTE = project_reference.note(PROJECT, head.name, copies)
+    agent_cli.EXTRA_DIRS = [str(path) for _, path in copies]
+
+
+def use_project(project):
+    """Point every path at this project (None: back to LAIka's defaults)."""
+    global PROJECT, REPO_ROOT, WORKTREE_ROOT, LOG_ROOT, GROUP_NOTE
+    PROJECT = project
+    GROUP_NOTE = ""
+    agent_cli.EXTRA_DIRS = []
+    if project is None:
+        defaults = laika_projects.builtin_defaults()
+        REPO_ROOT, WORKTREE_ROOT, LOG_ROOT = (
+            Path(defaults["repo"]), Path(defaults["worktrees"]), Path(defaults["logs"]))
+    else:
+        REPO_ROOT, WORKTREE_ROOT, LOG_ROOT = project.repo, project.worktrees, project.logs
+
+
+def gate_env(worktree=None):
+    """Environment for project gates: the worktree's own .venv and
+    node_modules/.bin (from the setup step) first, then LAIka's venv, so
+    'python3 -m pytest' finds test tooling; system tools still resolve."""
+    env = os.environ.copy()
+    venv_bin = str(Path(LAIKA_PYTHON).parent)
+    paths = [venv_bin, *project_sandbox.toolchain_paths()]
+    if worktree is not None:
+        for local in (Path(worktree) / "node_modules/.bin", Path(worktree) / ".venv/bin"):
+            if local.is_dir():
+                paths.insert(0, str(local))
+    env["PATH"] = os.pathsep.join(paths) + os.pathsep + env.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+    # Keep gates from writing caches into the worktree in the first place.
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTEST_ADDOPTS"] = (env.get("PYTEST_ADDOPTS", "") + " -p no:cacheprovider").strip()
+    return env
+
+
+def untracked_files(worktree):
+    """Untracked, non-ignored files in a worktree (paths relative to it)."""
+    out = run_git("ls-files", "--others", "--exclude-standard", "-z", cwd=worktree, check=False).stdout
+    return {path for path in out.split("\0") if path}
+
+
+SETUP_MARKER = "laika-setup-done"
+SETUP_EXCLUDE_HEADER = "# laika: dependency files from each project's setup step (never committed)"
+
+
+def _exclude_pattern(name):
+    """A root-anchored gitignore pattern for one top-level name."""
+    escaped = "".join("\\" + c if c in "*?[]\\!# " else c for c in name)
+    return "/" + escaped
+
+
+STANDARD_EXCLUDES = ("__pycache__/", "*.pyc", ".pytest_cache/", "node_modules/", ".venv/", ".dart_tool/")
+# Files whose change means dependencies must be installed again.
+DEPENDENCY_MANIFESTS = ("package.json", "package-lock.json", "requirements.txt", "pyproject.toml",
+                        "pubspec.yaml", "pubspec.lock", "Cargo.toml", "go.mod")
+
+
+def setup_fingerprint(worktree, command):
+    """What a finished setup step covered: its command and the dependency
+    manifests at that time (a builder adding a package re-runs setup)."""
+    import hashlib
+    digest = hashlib.sha256(command.encode())
+    for name in DEPENDENCY_MANIFESTS:
+        path = Path(worktree) / name
+        if path.is_file() and not path.is_symlink():
+            digest.update(name.encode() + b"\0" + path.read_bytes())
+    return digest.hexdigest()
+STANDARD_EXCLUDE_HEADER = "# laika: caches and installed dependencies (never committed)"
+
+
+def ensure_standard_excludes(worktree):
+    """Keep caches and installed dependencies out of every commit of a
+    project, whoever creates them (the builder now has network and may run
+    npm install / pytest itself): the repository's shared info/exclude,
+    which only LAIka writes (sandboxes see .git read-only)."""
+    common = run_git("rev-parse", "--git-common-dir", cwd=worktree).stdout.strip()
+    exclude = (Path(worktree) / common).resolve() / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    existing = exclude.read_text().splitlines() if exclude.exists() else []
+    missing = [pattern for pattern in STANDARD_EXCLUDES if pattern not in existing]
+    if missing:
+        header = [] if STANDARD_EXCLUDE_HEADER in existing else [STANDARD_EXCLUDE_HEADER]
+        with exclude.open("a") as handle:
+            handle.write("\n".join(["", *header, *missing]) + "\n")
+
+
+def ignore_setup_output(worktree, created):
+    """Keep what setup installed (node_modules, .venv, lock files it wrote)
+    out of every commit: its top-level names go into the repository's shared
+    info/exclude, which only LAIka writes (sandboxes see .git read-only)."""
+    names = sorted({path.split("/", 1)[0] for path in created if path and path.split("/", 1)[0] not in (".git", "")})
+    if not names:
+        return
+    common = run_git("rev-parse", "--git-common-dir", cwd=worktree).stdout.strip()
+    exclude = (Path(worktree) / common).resolve() / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    existing = exclude.read_text().splitlines() if exclude.exists() else []
+    lines = [line for line in (_exclude_pattern(n) for n in names) if line not in existing]
+    if lines:
+        header = [] if SETUP_EXCLUDE_HEADER in existing else [SETUP_EXCLUDE_HEADER]
+        with exclude.open("a") as handle:
+            handle.write("\n".join(["", *header, *lines]) + "\n")
+
+
+def project_setup(worktree, timeout=900):
+    """(ok, output). Installs a project's dependencies in a worktree once,
+    with network, inside the project sandbox. Tests stay offline."""
+    command = (PROJECT.setup_command or laika_projects.detect_setup(worktree)) if PROJECT else ""
+    if not command:
+        return True, ""
+    gitdir = Path(run_git("rev-parse", "--absolute-git-dir", cwd=worktree).stdout.strip())
+    marker = gitdir / SETUP_MARKER
+    fingerprint = setup_fingerprint(worktree, command)
+    if marker.is_file() and marker.read_text() == fingerprint:
+        return True, ""
+    tracked_clean = not run_git("status", "--porcelain", "--untracked-files=no", cwd=worktree).stdout.strip()
+    before = untracked_files(worktree)
+    argv = project_sandbox.command(["/bin/sh", "-c", command], PROJECT, worktree, kind="setup")
+    try:
+        result = subprocess.run(argv, cwd=worktree, text=True, capture_output=True,
+                                timeout=timeout, env=gate_env(worktree))
+    except subprocess.TimeoutExpired:
+        return False, f"$ {command}  (setup)\ntimed out after {timeout}s\n"
+    finally:
+        # Setup must not change tracked files (npm install rewriting a lock
+        # file would otherwise end up in the candidate).
+        if tracked_clean:
+            run_git("checkout", "--", ".", cwd=worktree, check=False)
+        ignore_setup_output(worktree, untracked_files(worktree) - before)
+    if result.returncode == 0:
+        # After the run: setup may write lock files (pubspec.lock, ...).
+        marker.write_text(setup_fingerprint(worktree, command))
+    output = f"$ {command}  (setup)\n{result.stdout}{result.stderr}"
+    return result.returncode == 0, output[-6000:]
+
+
+def gate_network(builder_id):
+    """Tests of this builder's change may use the internet (the operator
+    allowed it for the change or the project; services/network_access.py)."""
+    if PROJECT is None or PROJECT.is_builtin or not builder_id:
+        return False
+    return network_access.allowed(laika_projects.effective_fields(redis, PROJECT.id),
+                                  redis.hgetall(f"laika:jobs:{builder_id}"))
+
+
+def agent_final_text(log_path):
+    result = agent_cli.read_claude_result(log_path)
+    if result is not None:
+        return str(result.get("result") or "")
+    try:
+        return "\n".join(agent_cli.agent_messages(log_path)[-2:])
+    except Exception:
+        return ""
+
+
+def note_network_need(builder_id, gate_output, step, agent_text=""):
+    """After failed tests: record an internet-access request on the builder
+    when the failure points at the network (the orchestrator then asks the
+    operator instead of retrying)."""
+    if PROJECT is None or PROJECT.is_builtin or not builder_id:
+        return
+    key = f"laika:jobs:{builder_id}"
+    fields = network_access.request(redis.hgetall(key), gate_output, step, agent_text,
+                                    laika_projects.effective_fields(redis, PROJECT.id))
+    if fields:
+        redis.hset(key, mapping={**fields, "network_request_at": str(time.time())})
+
+
+def project_gate(worktree, timeout=900, network=False):
+    """(ok, output) of a non-LAIka project's own gate command, run in worktree.
+    An empty gate command is detected from the worktree (detect_gate).
+    network=True: the operator allowed internet access for these tests."""
+    setup_ok, setup_output = project_setup(worktree)
+    if not setup_ok:
+        return False, setup_output + "\ndependency setup failed; tests were not run\n"
+    command = (PROJECT.gate_command or laika_projects.detect_gate(worktree)) if PROJECT else ""
+    if not command:
+        return True, setup_output + f"no gate command configured or detected for project {PROJECT.id if PROJECT else '?'}; nothing to run\n"
+    # A gate must leave the worktree as it found it: files it creates (caches,
+    # build output) would otherwise be committed into the candidate or make
+    # the integrated worktree look modified. Only files that were not there
+    # before the gate are removed, by exact path; the builder's own new files
+    # and every tracked file are never touched.
+    before = untracked_files(worktree)
+    try:
+        argv = project_sandbox.command(["/bin/sh", "-c", command], PROJECT, worktree, kind="gate", network=network)
+        result = subprocess.run(argv, cwd=worktree, text=True,
+                                capture_output=True, timeout=timeout, env=gate_env(worktree))
+    except subprocess.TimeoutExpired:
+        return False, f"$ {command}\ntimed out after {timeout}s\n"
+    finally:
+        created = sorted(untracked_files(worktree) - before)
+        if created:
+            run_git("clean", "-f", "-q", "--", *created, cwd=worktree, check=False)
+    note = "(internet access allowed by the operator)\n" if network else ""
+    return result.returncode == 0, setup_output + note + f"$ {command}\n{result.stdout}{result.stderr}"
+
+
+def integration_worktree(job_id):
+    return (WORKTREE_ROOT / f"job-{job_id}-integration").resolve()
+
+
+def cleanup_integration(job_id, data=None):
+    data = data or redis.hgetall(f"laika:jobs:{job_id}")
+    path = integration_worktree(job_id)
+    branch = f"laika/integration-{job_id}"
+    recorded_value = data.get("integration_worktree", "")
+    recorded = Path(recorded_value).resolve() if recorded_value else None
+    if recorded is not None and recorded != path:
+        raise RuntimeError(f"Unexpected integration worktree: {recorded}")
+    if path.exists():
+        run_git("worktree", "remove", "--force", str(path))
+    branch_exists = run_git("show-ref", "--verify", f"refs/heads/{branch}", check=False)
+    if branch_exists.returncode == 0:
+        run_git("branch", "-D", branch)
+
+
+def prepare_integration(job_id):
+    """Integrate source candidates without touching main, then run the gate."""
+    key = f"laika:jobs:{job_id}"
+    lock_key = f"laika:integration-lock:{job_id}"
+    lock_owner = f"{WORKER_ID}:{uuid.uuid4().hex}"
+    lock_ttl = max(MAX_RUNTIME + 300, 7200)
+
+    # Exactly one worker may create/replace a job's integration candidate.
+    # The TTL provides crash recovery; ownership-safe release prevents an
+    # expired/reacquired lock from being deleted by the previous owner.
+    acquired = redis.set(lock_key, lock_owner, nx=True, ex=lock_ttl)
+    if not acquired:
+        return False
+
+    try:
+        return _prepare_integration_locked(job_id, key)
+    finally:
+        redis.eval(
+            """
+            if redis.call('get', KEYS[1]) == ARGV[1] then
+                return redis.call('del', KEYS[1])
+            end
+            return 0
+            """,
+            1,
+            lock_key,
+            lock_owner,
+        )
+
+
+def _prepare_integration_locked(job_id, key):
+    data = redis.hgetall(key)
+    integration_metadata = {}
+    if data.get("integration_status") == "passed" and data.get("integrated_candidate_commit"):
+        return True
+
+    if run_git("status", "--porcelain").stdout.strip():
+        redis.hset(key, mapping={"status": "integration_failed", "integration_status": "failed",
+                                  "integration_error": "main worktree is not clean",
+                                  "updated_at": str(time.time())})
+        return False
+
+    try:
+        cleanup_integration(job_id, data)
+        base = run_git("rev-parse", "HEAD").stdout.strip()
+        raw_sources = data.get("source_candidate_commits", "")
+        if raw_sources:
+            sources = json.loads(raw_sources)
+        else:
+            sources = [data.get("candidate_commit", "")]
+        if not isinstance(sources, list) or not sources or not all(sources):
+            raise RuntimeError("missing ordered source candidate commits")
+
+        path = integration_worktree(job_id)
+        branch = f"laika/integration-{job_id}"
+        WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
+        run_git("worktree", "add", "-b", branch, str(path), base)
+        redis.hset(key, mapping={
+            "integration_worktree": str(path),
+            "integration_branch": branch,
+            "integration_base_commit": base,
+            "source_candidate_commits": json.dumps(sources, separators=(",", ":")),
+            "integration_status": "running",
+            "updated_at": str(time.time()),
+        })
+
+        for source in sources:
+            result = run_git("cherry-pick", "--no-edit", source, cwd=path, check=False)
+            if result.returncode != 0:
+                run_git("cherry-pick", "--abort", cwd=path, check=False)
+                raise RuntimeError(f"cannot apply source candidate {source}: {result.stderr.strip()}")
+
+        if PROJECT is not None and not PROJECT.is_builtin:
+            gate_ok, gate_output = project_gate(path, network=gate_network(job_id))
+            if not gate_ok:
+                note_network_need(job_id, gate_output, "integration tests")
+            gate = subprocess.CompletedProcess([], 0 if gate_ok else 1, gate_output, "")
+        else:
+            env = os.environ.copy()
+            env["REPO_ROOT"] = str(path)
+            gate = subprocess.run(
+                [str(path / "scripts/integration-check.py")],
+                cwd=path, env=env, text=True, capture_output=True,
+            )
+        integrated = run_git("rev-parse", "HEAD", cwd=path).stdout.strip()
+        integration_metadata = {
+            "returncode": gate.returncode,
+            "stdout": gate.stdout[-4000:],
+            "stderr": gate.stderr[-4000:],
+            "commit": integrated,
+        }
+        if gate.returncode != 0:
+            raise RuntimeError("deterministic integration gate failed")
+
+        redis.hset(key, mapping={
+            "status": "awaiting_review",
+            "integration_status": "passed",
+            "integrated_candidate_commit": integrated,
+            "integration_result": json.dumps(integration_metadata, separators=(",", ":")),
+            "updated_at": str(time.time()),
+        })
+        return True
+    except Exception as exc:
+        current = redis.hgetall(key)
+        try:
+            cleanup_integration(job_id, current)
+        except Exception:
+            pass
+        redis.hset(key, mapping={
+            "status": "integration_failed",
+            "integration_status": "failed",
+            "integration_error": str(exc),
+            "integration_result": json.dumps(
+                {**integration_metadata, "error": str(exc)},
+                separators=(",", ":"),
+            ),
+            "updated_at": str(time.time()),
+        })
+        return False
+
+
+def create_worktree(job_id, suffix=""):
+    WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
+
+    branch = f"laika/job-{job_id}{suffix}"
+    path = WORKTREE_ROOT / f"job-{job_id}{suffix}"
+
+    # A retried or orphaned build leaves this job's own worktree and branch
+    # behind. Once the job is claimed again they are stale by definition.
+    run_git("worktree", "prune", check=False)
+    if path.exists():
+        run_git("worktree", "remove", "--force", str(path), check=False)
+        if path.exists():
+            raise RuntimeError(f"Stale worktree could not be removed: {path}")
+    if run_git("show-ref", "--verify", f"refs/heads/{branch}", check=False).returncode == 0:
+        run_git("branch", "-D", branch)
+
+    run_git("worktree", "add", "-b", branch, str(path), PROJECT.default_branch if PROJECT else "main")
+    if PROJECT is not None and not PROJECT.is_builtin:
+        ensure_standard_excludes(path)
+        # Dependencies before the builder starts, so it can run the tests.
+        # A failure is reported again (and retried) by the gate.
+        try:
+            project_setup(path)
+        except Exception as exc:
+            print(f"[{WORKER_ID}] setup warning for {path.name}: {exc}", flush=True)
+    return branch, path
+
+
+def parse_codex_log(log_path):
+    """(session_id, usage) from a job log: Codex JSONL or a Claude result."""
+    claude_result = agent_cli.read_claude_result(log_path)
+    if claude_result is not None:
+        return str(claude_result.get("session_id") or ""), agent_cli.claude_usage(claude_result)
+    session_id = ""
+    usage = {
+        "input_tokens": "",
+        "cached_input_tokens": "",
+        "output_tokens": "",
+        "reasoning_tokens": "",
+        "uncached_input_tokens": "",
+        "effective_tokens": "",
+        "total_tokens": "",
+        "command_count": "0",
+        "turn_completed": "0",
+    }
+
+    try:
+        for line in log_path.read_text(errors="replace").splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if not session_id:
+                session_id = str(
+                    event.get("thread_id")
+                    or event.get("session_id")
+                    or event.get("conversation_id")
+                    or ""
+                )
+
+            if event.get("type") == "turn.completed":
+                usage["turn_completed"] = "1"
+
+            item = event.get("item")
+            if (
+                event.get("type") == "item.started"
+                and isinstance(item, dict)
+                and item.get("type") == "command_execution"
+            ):
+                usage["command_count"] = str(int(usage["command_count"]) + 1)
+
+            event_usage = event.get("usage")
+            if isinstance(event_usage, dict):
+                input_tokens = event_usage.get("input_tokens")
+                cached_tokens = event_usage.get("cached_input_tokens")
+                output_tokens = event_usage.get("output_tokens")
+                reasoning_tokens = event_usage.get("reasoning_output_tokens")
+
+                if input_tokens is not None:
+                    usage["input_tokens"] = str(input_tokens)
+
+                if cached_tokens is not None:
+                    usage["cached_input_tokens"] = str(cached_tokens)
+
+                if output_tokens is not None:
+                    usage["output_tokens"] = str(output_tokens)
+
+                if reasoning_tokens is not None:
+                    usage["reasoning_tokens"] = str(reasoning_tokens)
+
+                if input_tokens is not None or output_tokens is not None:
+                    raw_input = int(input_tokens or 0)
+                    cached = min(int(cached_tokens or 0), raw_input)
+                    output = int(output_tokens or 0)
+                    usage["uncached_input_tokens"] = str(raw_input - cached)
+                    usage["effective_tokens"] = str(raw_input - cached + output)
+                    usage["total_tokens"] = str(raw_input + output)
+
+    except OSError:
+        pass
+
+    return session_id, usage
+
+
+def run_codex(job, worktree, log_path):
+    model = job.get("model", DEFAULT_MODEL)
+    prompt = job["prompt"]
+    role = job.get("role", "builder")
+
+    if role not in {"builder", "reviewer", "repair"}:
+        raise RuntimeError(f"Unsupported job role: {role}")
+
+    sandbox = "read-only" if role == "reviewer" else "workspace-write"
+    runtime_limit = int(job.get("timeout_seconds") or role_limit(
+        role, "TIMEOUT_SECONDS", ROLE_RUNTIME_DEFAULTS
+    ))
+    token_budget = int(job.get("token_budget") or role_limit(
+        role, "TOKEN_BUDGET", ROLE_TOKEN_DEFAULTS
+    ))
+    enforcement_budget = int(job.get("enforcement_budget") or role_limit(
+        role, "ENFORCEMENT_BUDGET", ROLE_ENFORCEMENT_DEFAULTS
+    ))
+    enforcement_budget = min(enforcement_budget, token_budget)
+    prompt = efficiency_prefix(role) + prompt
+
+    command = [
+        "codex",
+        "exec",
+        "--model", model,
+        "--sandbox", sandbox,
+        "--ephemeral",
+        "--color", "never",
+        "--json",
+        "--cd", str(worktree),
+        "-",
+    ]
+
+    env = os.environ.copy()
+    env["HOME"] = os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
+    # Projects: inside the project sandbox (reviewers read-only).
+    command = project_sandbox.codex_command(command, PROJECT, worktree, writable=(role != "reviewer"))
+
+    started = time.time()
+
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+
+        process.stdin.write(prompt)
+        process.stdin.close()
+
+        timed_out = False
+
+        while process.poll() is None:
+            try:
+                heartbeat("working")
+            except Exception as exc:
+                print(
+                    f"[{WORKER_ID}] heartbeat warning: {exc}",
+                    flush=True,
+                )
+
+            if time.time() - started >= runtime_limit:
+                timed_out = True
+                os.killpg(process.pid, signal.SIGTERM)
+
+            _, live_usage = parse_codex_log(log_path)
+            live_effective = int(live_usage.get("effective_tokens") or 0)
+            # Codex currently reports authoritative usage at turn.completed. Never
+            # kill a successfully completed turn after the work is already done.
+            # If future Codex versions emit mid-turn usage, this remains a useful
+            # live guard over non-cached input + output.
+            if (
+                live_effective >= enforcement_budget
+                and live_usage.get("turn_completed") != "1"
+                and process.poll() is None
+            ):
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                raise RuntimeError(
+                    f"Codex effective-token budget exceeded: {live_effective} >= {enforcement_budget} "
+                    f"(configured ceiling {token_budget}; cached input excluded)"
+                )
+
+            time.sleep(POLL_SECONDS)
+
+        if timed_out:
+            raise RuntimeError(
+                f"Codex exceeded {runtime_limit} second {role} timeout"
+            )
+
+    return process.returncode, time.time() - started
+
+
+def repair_allowed_bash():
+    """Shell commands a Claude builder/repair may run: focused validation and
+    read-only git. Anything else is refused (print mode never prompts)."""
+    allowed = (
+        "Bash(git status)", "Bash(git status *)",
+        "Bash(git diff)", "Bash(git diff *)",
+        "Bash(git log *)", "Bash(git show *)",
+    )
+    if PROJECT is not None and not PROJECT.is_builtin:
+        # The project's own gate is its focused validation.
+        return allowed + ((f"Bash({PROJECT.gate_command})",) if PROJECT.gate_command else ())
+    return (f"Bash({LAIKA_PYTHON} -m pytest *)", "Bash(node apps/web/app.test.js)") + allowed
+
+
+def run_review_aspects(job, worktree, log_path, timeout):
+    """Run the configured specialist reviews concurrently and combine them
+    into one Claude result at log_path (see agent_cli.combined_review_result).
+    Returns an unavailable/failed run as-is so run_agent can fall back."""
+    aspects = agent_cli.review_aspects()
+    runs, errors = {}, []
+
+    def review(aspect):
+        model = agent_cli.aspect_model(aspect)
+        prompt = (efficiency_prefix("reviewer") + job["prompt"] + "\n\n"
+                  + agent_cli.REVIEW_ASPECT_FOCUS[aspect])
+        run = agent_cli.run_claude(
+            "reviewer", prompt, worktree, log_path.with_name(f"{log_path.stem}.{aspect}.json"),
+            timeout, model=model, tick=lambda: heartbeat("working"), wrap=agent_sandbox(worktree))
+        if run.result is not None:
+            run.result["_model"] = model
+        runs[aspect] = run
+
+    threads = [threading.Thread(target=review, args=(a,), daemon=True) for a in aspects]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    for aspect in aspects:
+        run = runs.get(aspect)
+        if run is None or not run.ok:
+            return run or agent_cli.ClaudeRun(1, 0.0, None)  # unavailable/failed: caller decides
+    verdicts = {a: parse_review_verdict([runs[a].text])[0] for a in aspects}
+    missing = [a for a, v in verdicts.items() if v == "unknown"]
+    if missing:
+        raise RuntimeError(f"specialist review(s) gave no verdict: {', '.join(missing)}")
+    combined = agent_cli.combined_review_result(runs, verdicts)
+    log_path.write_text(json.dumps(combined))
+    return agent_cli.ClaudeRun(0, max(r.duration for r in runs.values()), combined)
+
+
+# --- best-of-N builds -------------------------------------------------------------
+#
+# A build that already failed once is built again by the configured builder
+# AND by the other provider in parallel, in separate worktrees. Each result
+# goes through the test gate; the winner must pass, then the smaller change
+# wins (ties: the configured builder). The winning change is applied to the
+# job's normal worktree, so integration and review are unchanged.
+
+BEST_OF_FROM_ATTEMPT = int(os.environ.get("BEST_OF_FROM_ATTEMPT", "2"))
+
+
+def best_of_enabled(job):
+    if BEST_OF_FROM_ATTEMPT <= 0 or job.get("role", "builder") != "builder":
+        return False
+    attempt = redis.hget(f"laika:jobs:{job['id']}", "build_attempt") or job.get("build_attempt") or "1"
+    try:
+        return int(attempt) >= BEST_OF_FROM_ATTEMPT
+    except ValueError:
+        return False
+
+
+def change_size(worktree):
+    """Lines added + removed, untracked files included (stages everything)."""
+    run_git("add", "-A", cwd=worktree)
+    total = 0
+    for line in run_git("diff", "--cached", "--numstat", cwd=worktree).stdout.splitlines():
+        added, removed = (line.split("\t") + ["0", "0"])[:2]
+        total += (int(added) if added.isdigit() else 0) + (int(removed) if removed.isdigit() else 0)
+    return total
+
+
+def run_alternate_builder(job, provider, worktree, log_path, timeout):
+    """(ok, duration, cost_usd, model) for the alternate provider's build."""
+    started = time.time()
+    if provider == "claude":
+        model = agent_cli.claude_model("builder")
+        run = agent_cli.run_claude(
+            "builder", efficiency_prefix("builder") + job["prompt"], worktree, log_path, timeout,
+            model=model, allowed_bash=repair_allowed_bash(), tick=lambda: heartbeat("working"),
+            wrap=agent_sandbox(worktree))
+        cost = agent_cli.claude_usage(run.result)["cost_usd"] if run.result else ""
+        return run.ok, run.duration, cost, model
+    independent = {**job, "role": "builder", "prompt": job["prompt"] + (
+        "\n\nThis is an independent second attempt built in parallel with another. "
+        "Prefer the simplest correct approach and keep the change small.")}
+    returncode, duration = run_codex(independent, worktree, log_path)
+    return returncode == 0, duration, "", job.get("model", DEFAULT_MODEL)
+
+
+def run_best_of(job, worktree, log_path):
+    """Build with both providers in parallel; keep the better passing change
+    in `worktree`. Returns (returncode, duration) like run_agent."""
+    job_id = str(job["id"])
+    key = f"laika:jobs:{job_id}"
+    primary_provider = agent_cli.role_provider("builder")
+    # Heavy building stays on Codex: the second build is an independent Codex
+    # attempt unless the operator opts in to another provider.
+    alt_provider = os.environ.get("BEST_OF_ALT_PROVIDER", "codex")
+    timeout = int(job.get("timeout_seconds") or role_limit(
+        "builder", "TIMEOUT_SECONDS", ROLE_RUNTIME_DEFAULTS))
+    slot = f"job:{job_id}:alt"
+    if alt_provider == "claude" and (
+        agent_cli.claude_cooling_down(redis)
+        or not agent_cli.wait_for_claude_slot(redis, slot, timeout + 120, 60,
+                                              tick=lambda: heartbeat("working"))
+    ):
+        redis.hset(key, "best_of", json.dumps({"skipped": "claude unavailable or at capacity"}))
+        return run_agent(job, worktree, log_path)
+
+    _, alt_worktree = create_worktree(job_id, "-alt")
+    alt_log = log_path.with_name(f"{log_path.stem}.alt{log_path.suffix}")
+    results = {}
+
+    def primary():
+        try:
+            results["primary"] = run_agent(job, worktree, log_path)
+        except Exception as exc:
+            results["primary_error"] = str(exc)
+
+    def alternate():
+        try:
+            results["alt"] = run_alternate_builder(job, alt_provider, alt_worktree, alt_log, timeout)
+        except Exception as exc:
+            results["alt_error"] = str(exc)
+
+    try:
+        threads = [threading.Thread(target=primary, daemon=True),
+                   threading.Thread(target=alternate, daemon=True)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        if alt_provider == "claude":
+            agent_cli.release_claude_slot(redis, slot)
+
+    report = {"primary": {"provider": primary_provider}, "alt": {"provider": alt_provider}}
+    candidates = {}
+    if "primary" in results and results["primary"][0] == 0:
+        candidates["primary"] = worktree
+    else:
+        report["primary"]["error"] = results.get("primary_error", "agent failed")
+    alt = results.get("alt")
+    if alt and alt[0]:
+        candidates["alt"] = alt_worktree
+        report["alt"].update(model=alt[3], cost_usd=alt[2])
+    else:
+        report["alt"]["error"] = results.get("alt_error", "agent failed")
+    for name, path in candidates.items():
+        tests_ok, _ = run_tests(path, network=gate_network(job.get("id")))
+        report[name].update(tests=tests_ok, lines=change_size(path) if tests_ok else None)
+    passing = [n for n in ("primary", "alt") if report[n].get("tests")]
+    chosen = min(passing, key=lambda n: (report[n]["lines"] or 0, n != "primary")) if passing else "primary"
+    report["chosen"] = chosen
+
+    try:
+        if chosen == "alt":
+            patch = run_git("diff", "--cached", "--binary", cwd=alt_worktree).stdout
+            run_git("reset", "--hard", "HEAD", cwd=worktree)
+            run_git("clean", "-fd", cwd=worktree)
+            applied = subprocess.run(["git", "apply", "--binary", "--index", "-"], cwd=worktree,
+                                     input=patch, text=True, capture_output=True)
+            if applied.returncode != 0:
+                raise RuntimeError(f"could not apply the alternate build: {applied.stderr.strip()}")
+            run_git("reset", "-q", cwd=worktree)  # leave changes unstaged, as a builder would
+            redis.hset(key, mapping={"provider": alt_provider, "model": report["alt"].get("model", "")})
+        elif chosen == "primary":
+            run_git("reset", "-q", cwd=worktree)
+    finally:
+        redis.hset(key, mapping={"best_of": json.dumps(report), "updated_at": str(time.time())})
+        run_git("worktree", "remove", "--force", str(alt_worktree), check=False)
+        run_git("branch", "-D", f"laika/job-{job_id}-alt", check=False)
+    print(f"[{WORKER_ID}] job={job_id} best-of: {json.dumps(report)}", flush=True)
+
+    if chosen == "primary" and "primary" not in candidates:
+        if "primary" in results:
+            return results["primary"]
+        raise RuntimeError(f"best-of build failed: {report}")
+    return 0, max(results.get("primary", (0, 0))[1], (alt or (0, 0))[1])
+
+
+def run_agent(job, worktree, log_path):
+    """Run the provider configured for this job's role (ROLE_PROVIDERS).
+
+    Claude falls back to Codex when it cannot serve the call (plan limit,
+    auth, overload) and then cools down for CLAUDE_COOLDOWN_SECONDS so later
+    jobs skip straight to Codex. Records the provider and model that ran.
+    """
+    role = job.get("role", "builder")
+    key = f"laika:jobs:{job['id']}"
+    provider = agent_cli.role_provider(role)
+    fallback = ""
+    if provider == "claude" and agent_cli.claude_cooling_down(redis):
+        provider, fallback = "codex", "claude cooling down after an unavailable response"
+
+    slot = f"job:{job['id']}"
+    if provider == "claude":
+        timeout = int(job.get("timeout_seconds") or role_limit(
+            role, "TIMEOUT_SECONDS", ROLE_RUNTIME_DEFAULTS))
+        redis.hset(key, mapping={"provider_wait": "waiting for a claude slot",
+                                 "updated_at": str(time.time())})
+        if not agent_cli.wait_for_claude_slot(
+                redis, slot, timeout + 120,
+                int(os.environ.get("CLAUDE_SLOT_WAIT_SECONDS", "900")),
+                tick=lambda: heartbeat("working")):
+            provider, fallback = "codex", "claude at capacity (CLAUDE_MAX_CONCURRENT)"
+        redis.hset(key, "provider_wait", "")
+
+    if provider == "claude":
+        try:
+            model = agent_cli.claude_model(role)
+            redis.hset(key, mapping={"provider": "claude", "model": model,
+                                     "updated_at": str(time.time())})
+            CURRENT_AGENT.update(provider="claude", model=model)
+            heartbeat("working")
+            if role == "reviewer" and job.get("rebase_check"):
+                model = os.environ.get("CLAUDE_REBASE_REVIEW_MODEL", "claude-haiku-4-5-20251001")
+                redis.hset(key, mapping={"model": model, "review_kind": "rebase_check"})
+                run = agent_cli.run_claude(
+                    role, efficiency_prefix(role) + job["prompt"] + REBASE_CHECK_NOTE, worktree,
+                    log_path, timeout, model=model, tick=lambda: heartbeat("working"),
+                    tools="", wrap=agent_sandbox(worktree))  # one turn: everything it needs is in the prompt
+            elif role == "reviewer" and len(agent_cli.review_aspects()) > 1:
+                run = run_review_aspects(job, worktree, log_path, timeout)
+            else:
+                run = agent_cli.run_claude(
+                    role, efficiency_prefix(role) + job["prompt"], worktree, log_path, timeout,
+                    model=model,
+                    allowed_bash=repair_allowed_bash() if role in ("builder", "repair") else (),
+                    tick=lambda: heartbeat("working"),
+                    wrap=agent_sandbox(worktree),
+                )
+            if run.unavailable:
+                fallback = f"claude unavailable: {run.describe_error()}"
+                agent_cli.start_cooldown(redis, fallback)
+                print(f"[{WORKER_ID}] job={job['id']} {fallback}; falling back to codex", flush=True)
+            elif run.timed_out:
+                raise RuntimeError(f"Claude exceeded {timeout} second {role} timeout")
+            elif not run.ok:
+                raise RuntimeError(f"Claude {role} failed: {run.describe_error()}")
+            else:
+                redis.hset(key, mapping={
+                    "cost_usd": agent_cli.claude_usage(run.result)["cost_usd"],
+                    "updated_at": str(time.time()),
+                })
+                return 0, run.duration
+        finally:
+            agent_cli.release_claude_slot(redis, slot)
+
+    model = job.get("model", DEFAULT_MODEL)
+    redis.hset(key, mapping={"provider": "codex", "model": model,
+                             "provider_fallback": fallback,
+                             "updated_at": str(time.time())})
+    CURRENT_AGENT.update(provider="codex", model=model)
+    heartbeat("working")
+    return run_codex(job, worktree, log_path)
+
+
+def run_tests(worktree, network=False):
+    if PROJECT is not None and not PROJECT.is_builtin:
+        return project_gate(worktree, network=network)
+    commands = [
+        [
+            LAIKA_PYTHON,
+            "-m",
+            "pytest",
+            "apps/api/tests",
+            "-q",
+        ],
+        [
+            LAIKA_PYTHON,
+            "-m",
+            "compileall",
+            "-q",
+            "apps/api",
+        ],
+    ]
+
+    output = []
+
+    for command in commands:
+        result = subprocess.run(
+            command,
+            cwd=worktree,
+            text=True,
+            capture_output=True,
+            timeout=300,
+        )
+
+        output.append(
+            "$ " + " ".join(command) + "\n"
+            + result.stdout
+            + result.stderr
+        )
+
+        if result.returncode != 0:
+            return False, "\n".join(output)
+
+    return True, "\n".join(output)
+
+
+def review_diff_packet(builder, candidate_commit, worktree):
+    """Return the complete candidate change for review.
+
+    The review range starts at the integration base, so a candidate built
+    from several source commits (builder + repairs) is reviewed as a whole
+    rather than as its last commit only. Files are included whole-file-first
+    until the budget is spent, and any omitted file is named explicitly.
+    """
+    base = builder.get("integration_base_commit") or f"{candidate_commit}^"
+    stat = run_git(
+        "diff", "--stat=200", base, candidate_commit,
+        cwd=worktree, check=False,
+    ).stdout.strip() or "(no file changes reported)"
+    names = [
+        name for name in run_git(
+            "diff", "--name-only", base, candidate_commit,
+            cwd=worktree, check=False,
+        ).stdout.splitlines() if name.strip()
+    ]
+    chunks, used, omitted = [], 0, []
+    for name in names:
+        piece = run_git(
+            "diff", "--no-ext-diff", "--unified=20", base, candidate_commit,
+            "--", name, cwd=worktree, check=False,
+        ).stdout or ""
+        if used + len(piece) > REVIEW_DIFF_CHARS:
+            omitted.append(name)
+            continue
+        chunks.append(piece)
+        used += len(piece)
+    diff = "".join(chunks) or "(empty diff)"
+    if omitted:
+        diff += (
+            "\n[LAIka: diff budget reached; these changed files were not "
+            "inlined. Read them from the worktree if they matter: "
+            + ", ".join(omitted) + "]"
+        )
+    return diff, stat, base
+
+
+def integration_gate_summary(builder):
+    raw = builder.get("integration_result", "")
+    try:
+        result = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        result = {}
+    if not result:
+        return "(no integration gate result recorded)"
+    code = result.get("returncode")
+    status = "PASSED" if code == 0 else f"FAILED (exit {code})"
+    output = (result.get("stdout") or "")[-REVIEW_GATE_CHARS:]
+    return f"Gate status: {status}\n{output}".rstrip()
+
+
+def prior_findings_packet(builder):
+    try:
+        history = json.loads(builder.get("review_findings_history") or "[]")
+    except (TypeError, ValueError):
+        history = []
+    if not isinstance(history, list) or not history:
+        return ""
+    parts = []
+    for item in history[-2:]:
+        if isinstance(item, dict):
+            parts.append(
+                f"Review {item.get('review_job_id', '?')} of "
+                f"{str(item.get('candidate', ''))[:12]}:\n"
+                f"{item.get('findings', '')}"
+            )
+    body = "\n\n".join(parts)[-REVIEW_PRIOR_CHARS:]
+    return (
+        "Previous review findings for this job (the repair was meant to "
+        f"address these):\n{body}\n\n"
+    )
+
+
+def parse_review_verdict(messages):
+    """Return (verdict, findings) from reviewer agent messages.
+
+    PASS_WITH_NOTES is recorded as verdict "pass": notes never block and the
+    approval contract (review_verdict == "pass") is unchanged.
+    """
+    verdict = "unknown"
+    for text in messages:
+        for message_line in str(text).splitlines():
+            normalized = message_line.strip()
+            if normalized in ("VERDICT: PASS", "VERDICT: PASS_WITH_NOTES"):
+                verdict = "pass"
+            elif normalized == "VERDICT: CHANGES_REQUIRED":
+                verdict = "changes_required"
+    findings = str(messages[-1]).strip()[-FINDINGS_CHARS:] if messages else ""
+    return verdict, findings
+
+
+def candidate_patch_id(base, candidate, worktree):
+    """Stable identity of the change base..candidate, independent of the base
+    it sits on (git patch-id --stable); '' when it cannot be computed."""
+    try:
+        diff = run_git("diff", base, candidate, cwd=worktree, check=False).stdout
+        if not diff.strip():
+            return ""
+        result = subprocess.run(["git", "patch-id", "--stable"], cwd=worktree, input=diff,
+                                text=True, capture_output=True)
+        return result.stdout.split()[0] if result.stdout.split() else ""
+    except Exception:
+        return ""
+
+
+DOC_SUFFIXES = (".md", ".rst", ".txt")
+
+
+def is_docs_only(base, candidate, worktree):
+    """True when every file the change touches is documentation."""
+    names = run_git("diff", "--name-only", base, candidate, cwd=worktree, check=False).stdout.split()
+    return bool(names) and all(n.startswith("docs/") or n.endswith(DOC_SUFFIXES) for n in names)
+
+
+DOCS_REVIEW_BAR = """
+THIS CHANGE IS DOCUMENTATION ONLY. Use this bar instead of the code bar above:
+- BLOCKING only for statements that are factually wrong about this repository,
+  or instructions/commands that would fail or cause harm if followed as written.
+- NOTE (never blocking): missing detail, extra coverage beyond what the task
+  explicitly asked for, wording, structure, or style.
+- Do not raise new BLOCKING findings about sections that earlier reviews already
+  examined and accepted; verify their earlier findings instead.
+"""
+
+
+MAIN_CHANGES_CHARS = int(os.environ.get("REBASE_MAIN_CHANGES_CHARS", "20000"))
+
+
+def main_changes_packet(old_base, new_base, worktree):
+    """What main changed between the last reviewed base and the new one."""
+    stat = run_git("diff", "--stat=200", old_base, new_base, cwd=worktree, check=False).stdout.strip()
+    diff = run_git("diff", old_base, new_base, cwd=worktree, check=False).stdout
+    if len(diff) > MAIN_CHANGES_CHARS:
+        diff = diff[:MAIN_CHANGES_CHARS] + "\n... (truncated)"
+    return (f"\nChanges on main since this change was last reviewed ({old_base[:12]}..{new_base[:12]}):\n"
+            f"{stat or '(none)'}\n\n{diff}")
+
+
+REBASE_CHECK_NOTE = (
+    "\n\nREBASE CHECK: this exact change (identical patch) was already reviewed and "
+    "passed against an older main; it has been re-integrated onto the current main, "
+    "and the gate passed there. You have no tools: answer from this prompt alone. "
+    "Compare the change with the main changes listed above and look only for problems "
+    "those introduce (conflicting behavior, broken assumptions, duplicated work). Do not "
+    "re-review the change from scratch.")
+
+
+def queue_review_job(builder_job_id):
+    builder_key = f"laika:jobs:{builder_job_id}"
+    builder = redis.hgetall(builder_key)
+
+    if not builder:
+        raise RuntimeError(f"Builder job not found: {builder_job_id}")
+
+    if builder.get("status") != "awaiting_review":
+        raise RuntimeError(
+            f"Builder job status is {builder.get('status')!r}; "
+            "expected 'awaiting_review'"
+        )
+
+    worktree = builder.get("integration_worktree")
+    if not worktree:
+        raise RuntimeError("Builder job has no integrated worktree")
+
+    candidate_commit = builder.get("integrated_candidate_commit")
+    if not candidate_commit:
+        raise RuntimeError("Builder job has no integrated candidate commit")
+
+    review_job_id = uuid.uuid4().hex[:8]
+
+    # Atomic duplicate guard. Only the process that successfully creates
+    # review_job_id is allowed to enqueue the reviewer.
+    if not redis.hsetnx(builder_key, "review_job_id", review_job_id):
+        return builder.get("review_job_id", ""), False
+
+    candidate_diff, diff_stat, review_base = review_diff_packet(
+        builder, candidate_commit, Path(worktree)
+    )
+    # Same change as an already-passed review, only re-integrated onto a newer
+    # main (merge queue): still a fresh review of this exact candidate, but a
+    # single cheap rebase check instead of the full specialist set.
+    patch_id = candidate_patch_id(review_base, candidate_commit, Path(worktree))
+    docs_only = is_docs_only(review_base, candidate_commit, Path(worktree))
+    rebase_check = bool(patch_id) and patch_id == builder.get("reviewed_patch_id")
+    main_changes = ""
+    if rebase_check and builder.get("reviewed_base_commit"):
+        main_changes = main_changes_packet(builder["reviewed_base_commit"], review_base, Path(worktree))
+    gate_summary = integration_gate_summary(builder)
+    prior_findings = prior_findings_packet(builder)
+
+    prompt = f"""You are the review agent for LAIka.
+
+Review builder job {builder_job_id}.
+Review immutable integrated candidate commit {candidate_commit}.
+The change under review is everything from {review_base} to {candidate_commit}.
+
+Original task:
+{builder.get("prompt", "")}
+
+Files changed by this candidate (git diff --stat {review_base} {candidate_commit}):
+{diff_stat}
+
+LAIka candidate diff (the complete change under review; inspect this first):
+{candidate_diff}
+
+LAIka deterministic integration gate result (already executed by LAIka on this exact candidate):
+{gate_summary}
+
+{prior_findings}
+You are operating inside the integrated candidate worktree.
+
+Do NOT run tests. Your sandbox is read-only and has no writable temporary
+directory, so pytest and similar tools will fail there. LAIka already ran the
+deterministic gate on this exact candidate; its result is above.
+
+Decide the verdict using this bar:
+
+BLOCKING (verdict CHANGES_REQUIRED) only for defects in code this candidate
+adds or changes:
+- incorrect behavior or a crash on realistic input
+- a stated requirement of the original task that is not met
+- a regression of existing behavior
+- a security or safety problem
+
+NON-BLOCKING (report as notes, never a reason for CHANGES_REQUIRED):
+- style, naming, refactoring, or maintainability preferences
+- speculative or extreme edge cases (for example terminals under 20 columns)
+- pre-existing issues in code this candidate did not change
+- test coverage suggestions when the gate passed
+
+If previous findings are listed above, first confirm whether each one is now
+resolved. Do not invent new blocking findings in areas that previous reviews
+already examined unless the latest change introduced them.
+
+Read surrounding code only to validate a concrete concern. Do not modify any
+files. Do not commit anything.
+
+End your response with exactly one verdict line:
+VERDICT: PASS
+or
+VERDICT: PASS_WITH_NOTES
+or
+VERDICT: CHANGES_REQUIRED
+
+Before the verdict, list findings with each marked BLOCKING or NOTE. If there
+are no material findings, explicitly say so.
+"""
+    if docs_only:
+        prompt += DOCS_REVIEW_BAR
+    if main_changes:
+        prompt += main_changes
+
+    created_at = time.time()
+
+    review_job = {
+        "id": review_job_id,
+        "prompt": prompt,
+        "provider": builder.get("provider", DEFAULT_PROVIDER),
+        "model": builder.get("model", DEFAULT_MODEL),
+        "role": "reviewer",
+        "builder_job_id": builder_job_id,
+        "worktree": worktree,
+        "candidate_commit": candidate_commit,
+        "integrated_candidate_commit": candidate_commit,
+        "patch_id": patch_id,
+        "rebase_check": rebase_check,
+        "created_at": created_at,
+    }
+
+    try:
+        redis.hset(
+            f"laika:jobs:{review_job_id}",
+            mapping={
+                "status": "queued",
+                "provider": review_job["provider"],
+                "model": review_job["model"],
+                "role": "reviewer",
+                "builder_job_id": builder_job_id,
+                "worktree": worktree,
+                "candidate_commit": candidate_commit,
+                "integrated_candidate_commit": candidate_commit,
+                "prompt": prompt,
+                "patch_id": patch_id,
+                "rebase_check": "1" if rebase_check else "",
+                "created_at": str(created_at),
+            },
+        )
+
+        redis.hset(
+            builder_key,
+            mapping={
+                "review_status": "queued",
+                "updated_at": str(time.time()),
+            },
+        )
+
+        redis.rpush(QUEUE_NAME, json.dumps(review_job))
+
+    except Exception:
+        # Release the reservation only if it is still ours.
+        current = redis.hget(builder_key, "review_job_id")
+        if current == review_job_id:
+            redis.hdel(builder_key, "review_job_id", "review_status")
+        redis.delete(f"laika:jobs:{review_job_id}")
+        raise
+
+    return review_job_id, True
+
+
+def process_review_job(job, key, log_path):
+    job_id = str(job["id"])
+    builder_job_id = str(job.get("builder_job_id", ""))
+    worktree_value = job.get("worktree")
+
+    if not builder_job_id:
+        raise RuntimeError("Reviewer job missing builder_job_id")
+
+    if not worktree_value:
+        raise RuntimeError("Reviewer job missing builder worktree")
+
+    worktree = Path(worktree_value).resolve()
+    expected = integration_worktree(builder_job_id)
+
+    if worktree != expected:
+        raise RuntimeError(f"Unexpected reviewer worktree: {worktree}")
+
+    if not worktree.exists():
+        raise RuntimeError(f"Builder worktree does not exist: {worktree}")
+
+    builder = redis.hgetall(f"laika:jobs:{builder_job_id}")
+    if not builder:
+        raise RuntimeError(f"Builder job not found: {builder_job_id}")
+
+    if builder.get("status") != "awaiting_review":
+        raise RuntimeError(
+            f"Builder job status is {builder.get('status')!r}; "
+            "expected 'awaiting_review'"
+        )
+
+    candidate_commit = str(job.get("integrated_candidate_commit") or job.get("candidate_commit", ""))
+    if not candidate_commit:
+        raise RuntimeError("Reviewer job missing candidate_commit")
+    if builder.get("integrated_candidate_commit") != candidate_commit:
+        raise RuntimeError("Reviewer candidate does not match integrated candidate")
+
+    head = run_git("rev-parse", "HEAD", cwd=worktree).stdout.strip()
+    if head != candidate_commit:
+        raise RuntimeError("Builder worktree HEAD does not match candidate commit")
+    if run_git("status", "--porcelain", cwd=worktree).stdout.strip():
+        raise RuntimeError("Builder worktree changed after candidate commit")
+
+    redis.hset(
+        key,
+        mapping={
+            "status": "reviewing",
+            "worker_id": WORKER_ID,
+            "worker_role": WORKER_ROLE,
+            "job_role": "reviewer",
+            "provider": job.get("provider", DEFAULT_PROVIDER),
+            "model": job.get("model", DEFAULT_MODEL),
+            "builder_job_id": builder_job_id,
+            "worktree": str(worktree),
+            "candidate_commit": candidate_commit,
+            "integrated_candidate_commit": candidate_commit,
+            "log": str(log_path),
+            "token_budget": str(job.get("token_budget") or role_limit("reviewer", "TOKEN_BUDGET", ROLE_TOKEN_DEFAULTS)),
+            "enforcement_budget": str(job.get("enforcement_budget") or role_limit("reviewer", "ENFORCEMENT_BUDGET", ROLE_ENFORCEMENT_DEFAULTS)),
+            "prompt_chars": str(len(job.get("prompt", ""))),
+            "timeout_seconds": str(job.get("timeout_seconds") or role_limit("reviewer", "TIMEOUT_SECONDS", ROLE_RUNTIME_DEFAULTS)),
+            "updated_at": str(time.time()),
+        },
+    )
+
+    returncode, duration = run_agent(job, worktree, log_path)
+    session_id, usage = parse_codex_log(log_path)
+
+    head_after = run_git("rev-parse", "HEAD", cwd=worktree).stdout.strip()
+    dirty_after = run_git("status", "--porcelain", cwd=worktree).stdout.strip()
+    if head_after != candidate_commit or dirty_after:
+        raise RuntimeError("Candidate changed during read-only review")
+
+    messages = agent_cli.agent_messages(log_path)
+
+    verdict, findings = parse_review_verdict(messages)
+
+    common = {
+        "review_verdict": verdict,
+        "review_findings": findings,
+        "reviewed_commit": candidate_commit,
+        "codex_exit_code": str(returncode),
+        "duration_seconds": f"{duration:.2f}",
+        "session_id": session_id,
+        "tokens": usage["total_tokens"],
+        "input_tokens": usage["input_tokens"],
+        "cached_input_tokens": usage["cached_input_tokens"],
+        "output_tokens": usage["output_tokens"],
+        "reasoning_tokens": usage["reasoning_tokens"],
+        "uncached_input_tokens": usage["uncached_input_tokens"],
+        "effective_tokens": usage["effective_tokens"],
+        "command_count": usage["command_count"],
+        "updated_at": str(time.time()),
+    }
+
+    if returncode != 0:
+        redis.hset(key, mapping={"status": "failed", **common})
+        redis.hset(
+            f"laika:jobs:{builder_job_id}",
+            mapping={
+                "review_job_id": job_id,
+                "review_status": "failed",
+                "review_verdict": verdict,
+                "reviewed_commit": candidate_commit,
+                "review_log": str(log_path),
+                "updated_at": str(time.time()),
+            },
+        )
+        raise RuntimeError(f"Reviewer Codex exited with status {returncode}")
+
+    review_aspects_json = json.dumps((agent_cli.read_claude_result(log_path) or {}).get("aspects") or {})
+    redis.hset(key, mapping={"status": "review_complete", "review_aspects": review_aspects_json, **common})
+    builder_update = {
+        # Only a passing review vouches for this patch identity.
+        "reviewed_patch_id": str(job.get("patch_id") or "") if verdict == "pass" else "",
+        "reviewed_base_commit": str(builder.get("integration_base_commit") or "") if verdict == "pass" else "",
+        "review_aspects": review_aspects_json,
+        "review_job_id": job_id,
+        "review_status": "complete",
+        "review_verdict": verdict,
+        "review_findings": findings,
+        "reviewed_commit": candidate_commit,
+        "review_log": str(log_path),
+        "updated_at": str(time.time()),
+    }
+    if verdict == "changes_required":
+        # Persist findings across repairs so the next independent reviewer
+        # can verify them instead of starting over with new nitpicks.
+        try:
+            history = json.loads(builder.get("review_findings_history") or "[]")
+        except (TypeError, ValueError):
+            history = []
+        if not isinstance(history, list):
+            history = []
+        history.append({
+            "review_job_id": job_id,
+            "candidate": candidate_commit,
+            "findings": findings[-3000:],
+        })
+        builder_update["review_findings_history"] = json.dumps(history[-5:])
+    redis.hset(f"laika:jobs:{builder_job_id}", mapping=builder_update)
+
+
+
+def restore_candidate(worktree, candidate):
+    """Return a builder worktree to its committed candidate.
+
+    A failed or interrupted repair leaves uncommitted edits (or, if the agent
+    committed despite instructions, extra commits) in the builder worktree.
+    Without this, every later repair refuses to start on the dirty tree and
+    the remaining attempts are burnt without a real try. Only moves HEAD back
+    along its own history; the committed candidate itself is never changed.
+    """
+    head = run_git("rev-parse", "HEAD", cwd=worktree).stdout.strip()
+    if head != candidate and run_git(
+        "merge-base", "--is-ancestor", candidate, head, cwd=worktree, check=False
+    ).returncode != 0:
+        raise RuntimeError("Repair worktree HEAD does not match reviewed candidate")
+    run_git("reset", "--hard", candidate, cwd=worktree)
+    run_git("clean", "-fd", cwd=worktree)
+
+
+def process_repair_job(job, key, log_path, test_log):
+    job_id = str(job["id"])
+    builder_job_id = str(job.get("target_builder_id", ""))
+
+    if not builder_job_id:
+        raise RuntimeError("Repair job missing target_builder_id")
+
+    builder_key = f"laika:jobs:{builder_job_id}"
+    builder = redis.hgetall(builder_key)
+
+    if not builder:
+        raise RuntimeError(f"Repair target not found: {builder_job_id}")
+
+    if builder.get("status") != "awaiting_review":
+        raise RuntimeError(
+            f"Repair target status is {builder.get('status')!r}; "
+            "expected 'awaiting_review'"
+        )
+
+    if builder.get("review_verdict") != "changes_required":
+        raise RuntimeError(
+            "Repair target does not currently require changes"
+        )
+
+    worktree_value = builder.get("worktree")
+    if not worktree_value:
+        raise RuntimeError("Repair target has no worktree")
+
+    worktree = Path(worktree_value).resolve()
+    expected = (WORKTREE_ROOT / f"job-{builder_job_id}").resolve()
+
+    if worktree != expected:
+        raise RuntimeError(f"Unexpected repair worktree: {worktree}")
+
+    if not worktree.exists():
+        raise RuntimeError(f"Repair worktree missing: {worktree}")
+
+    candidate_before = builder.get("candidate_commit")
+    if not candidate_before:
+        raise RuntimeError("Repair target has no candidate commit")
+
+    head = run_git("rev-parse", "HEAD", cwd=worktree).stdout.strip()
+    if head != candidate_before or run_git(
+        "status", "--porcelain", cwd=worktree
+    ).stdout.strip():
+        # Leftovers of an earlier failed or interrupted repair.
+        restore_candidate(worktree, candidate_before)
+
+    redis.hset(
+        key,
+        mapping={
+            "status": "repairing",
+            "worker_id": WORKER_ID,
+            "worker_role": WORKER_ROLE,
+            "job_role": "repair",
+            "target_builder_id": builder_job_id,
+            "worktree": str(worktree),
+            "candidate_before": candidate_before,
+            "log": str(log_path),
+            "token_budget": str(job.get("token_budget") or role_limit("repair", "TOKEN_BUDGET", ROLE_TOKEN_DEFAULTS)),
+            "enforcement_budget": str(job.get("enforcement_budget") or role_limit("repair", "ENFORCEMENT_BUDGET", ROLE_ENFORCEMENT_DEFAULTS)),
+            "prompt_chars": str(len(job.get("prompt", ""))),
+            "timeout_seconds": str(job.get("timeout_seconds") or role_limit("repair", "TIMEOUT_SECONDS", ROLE_RUNTIME_DEFAULTS)),
+            "updated_at": str(time.time()),
+        },
+    )
+
+    redis.hset(
+        builder_key,
+        mapping={
+            "repair_status": "running",
+            "updated_at": str(time.time()),
+        },
+    )
+
+    try:
+        returncode, duration = run_agent(job, worktree, log_path)
+        session_id, usage = parse_codex_log(log_path)
+
+        common = {
+            "codex_exit_code": str(returncode),
+            "duration_seconds": f"{duration:.2f}",
+            "session_id": session_id,
+            "tokens": usage["total_tokens"],
+            "input_tokens": usage["input_tokens"],
+            "cached_input_tokens": usage["cached_input_tokens"],
+            "output_tokens": usage["output_tokens"],
+            "reasoning_tokens": usage["reasoning_tokens"],
+            "uncached_input_tokens": usage["uncached_input_tokens"],
+            "effective_tokens": usage["effective_tokens"],
+            "command_count": usage["command_count"],
+            "updated_at": str(time.time()),
+        }
+
+        redis.hset(key, mapping=common)
+
+        if returncode != 0:
+            raise RuntimeError(
+                f"Repair Codex exited with status {returncode}"
+            )
+
+        redis.hset(key, mapping={"status": "testing"})
+
+        tests_ok, tests_output = run_tests(worktree, network=gate_network(builder_job_id))
+        test_log.write_text(tests_output)
+        redis.hset(key, mapping={"test_status": "passed" if tests_ok else "failed"})
+
+        if not tests_ok:
+            note_network_need(builder_job_id, tests_output, "repair tests", agent_final_text(log_path))
+            redis.hset(
+                key,
+                mapping={
+                    "status": "test_failed",
+                    "test_log": str(test_log),
+                    "updated_at": str(time.time()),
+                },
+            )
+            redis.hset(
+                builder_key,
+                mapping={
+                    "repair_status": "test_failed",
+                    "updated_at": str(time.time()),
+                },
+            )
+            restore_candidate(worktree, candidate_before)
+            return
+
+        diff = run_git("status", "--porcelain", cwd=worktree).stdout
+
+        if not diff.strip():
+            redis.hset(
+                key,
+                mapping={
+                    "status": "repair_no_changes",
+                    "test_log": str(test_log),
+                    "updated_at": str(time.time()),
+                },
+            )
+            redis.hset(
+                builder_key,
+                mapping={
+                    "repair_status": "no_changes",
+                    "updated_at": str(time.time()),
+                },
+            )
+            return
+
+        run_git("add", "-A", cwd=worktree)
+        run_git(
+            "commit",
+            "-m",
+            f"Repair LAIka job {builder_job_id} via {job_id}",
+            cwd=worktree,
+        )
+
+        candidate_after = run_git(
+            "rev-parse", "HEAD", cwd=worktree
+        ).stdout.strip()
+
+        if candidate_after == candidate_before:
+            raise RuntimeError("Repair did not create a new candidate")
+
+        if run_git("status", "--porcelain", cwd=worktree).stdout.strip():
+            raise RuntimeError("Repair candidate is dirty after commit")
+    except Exception:
+        # Never leave a failed repair's edits for the next attempt.
+        try:
+            restore_candidate(worktree, candidate_before)
+        except Exception as restore_exc:
+            print(f"[{WORKER_ID}] repair={job_id} restore failed: {restore_exc}", flush=True)
+        raise
+
+    old_review = builder.get("review_job_id", "")
+
+    history = builder.get("review_history", "")
+    history_item = (
+        f"{old_review}:{candidate_before}:"
+        f"{builder.get('review_verdict', '')}"
+    )
+
+    history = (
+        f"{history},{history_item}"
+        if history
+        else history_item
+    )
+
+    # Remove the old review reservation so queue_review_job() can
+    # atomically reserve a fresh independent reviewer.
+    redis.hdel(
+        builder_key,
+        "review_job_id",
+        "review_status",
+        "review_verdict",
+        "reviewed_commit",
+        "review_error",
+    )
+
+    # A repaired candidate must be integrated and reviewed from scratch.
+    # Keep the old integration worktree/branch metadata so prepare_integration
+    # can safely clean them up before creating the new integrated candidate.
+    redis.hdel(
+        builder_key,
+        "integration_status",
+        "integration_base_commit",
+        "integrated_candidate_commit",
+        "integration_result",
+        "integration_error",
+    )
+
+    raw_sources = builder.get("source_candidate_commits", "")
+    if raw_sources:
+        try:
+            sources = json.loads(raw_sources)
+        except (TypeError, ValueError):
+            sources = []
+    else:
+        sources = []
+
+    if not isinstance(sources, list):
+        sources = []
+
+    if not sources:
+        original_candidate = builder.get("candidate_commit", "")
+        if original_candidate:
+            sources = [original_candidate]
+
+    if not sources or sources[-1] != candidate_after:
+        sources.append(candidate_after)
+
+    redis.hset(
+        builder_key,
+        mapping={
+            "candidate_commit": candidate_after,
+            "source_candidate_commits": json.dumps(sources, separators=(",", ":")),
+            "review_history": history,
+            "repair_status": "completed",
+            "last_repair_job_id": job_id,
+            "updated_at": str(time.time()),
+        },
+    )
+
+    redis.hset(
+        key,
+        mapping={
+            "status": "repair_complete",
+            "candidate_before": candidate_before,
+            "candidate_after": candidate_after,
+            "test_log": str(test_log),
+            "updated_at": str(time.time()),
+        },
+    )
+
+    if not prepare_integration(builder_job_id):
+        print(
+            f"[{WORKER_ID}] repair={job_id} integration failed",
+            flush=True,
+        )
+        return
+
+    review_job_id, queued = queue_review_job(builder_job_id)
+
+    print(
+        f"[{WORKER_ID}] repair={job_id} "
+        f"builder={builder_job_id} "
+        f"candidate={candidate_after[:12]} "
+        f"review={review_job_id} "
+        f"{'queued' if queued else 'already queued'}",
+        flush=True,
+    )
+
+def process_integrate_job(job, key):
+    """Operator-requested (re)integration of an existing builder candidate.
+
+    Used for stale candidates (main moved after integration) and for
+    re-reviewing jobs that exhausted repairs. The ordered source commits are
+    preserved; only derived integration/review state was cleared by the
+    host-side request. Main is never modified here.
+    """
+    builder_job_id = str(job.get("target_builder_id", ""))
+    if not builder_job_id:
+        raise RuntimeError("Integrate job missing target_builder_id")
+    redis.hset(key, mapping={
+        "status": "integrating",
+        "worker_id": WORKER_ID,
+        "job_role": "integrate",
+        "target_builder_id": builder_job_id,
+        "updated_at": str(time.time()),
+    })
+    builder = redis.hgetall(f"laika:jobs:{builder_job_id}")
+    if builder.get("status") != "awaiting_review":
+        raise RuntimeError(
+            f"Integrate target status is {builder.get('status')!r}; expected 'awaiting_review'"
+        )
+    if not prepare_integration(builder_job_id):
+        current = redis.hgetall(f"laika:jobs:{builder_job_id}")
+        redis.hset(key, mapping={
+            "status": "integration_failed",
+            "error": current.get("integration_error", "integration did not pass or is already running"),
+            "updated_at": str(time.time()),
+        })
+        return
+    review_job_id, queued = queue_review_job(builder_job_id)
+    redis.hset(key, mapping={
+        "status": "integrate_complete",
+        "review_job_id": review_job_id,
+        "updated_at": str(time.time()),
+    })
+    print(
+        f"[{WORKER_ID}] reintegrated builder={builder_job_id} "
+        f"review={review_job_id} {'queued' if queued else 'already queued'}",
+        flush=True,
+    )
+
+
+# --- scheduling -----------------------------------------------------------------
+#
+# Workers no longer take the oldest job. Each pick ranks every ready job:
+#   1. importance tier of its project. General workers: high, medium, low.
+#      Support workers (WORKER_CLASS=support): medium, low, then high, so low
+#      and medium work keeps moving while high work dominates the pool.
+#   2. work already in flight (review, repair, integrate) before new builds;
+#   3. least remaining effort of the project (laika:project-stats, published
+#      by the orchestrator), minus an aging bonus so a big project that has
+#      waited long enough is not starved by a stream of small ones;
+#   4. oldest first.
+# The ranking is recomputed on every pick, so importance changes and new
+# prompts take effect immediately; running jobs are never preempted. A job is
+# claimed with LREM (atomic): losing a race just moves on to the next one.
+
+def worker_class(worker_id=None, env=os.environ, running=None):
+    """"support" for the last of the running workers (one in four, at most
+    SUPPORT_WORKERS; Settings → Workers), else "general"; WORKER_CLASS
+    forces one. running: how many workers run now (the scaler's target,
+    laika:scaler:target), else WORKER_COUNT."""
+    if env.get("WORKER_CLASS"):
+        return env["WORKER_CLASS"]
+    try:
+        number = int(str(worker_id or WORKER_ID).rsplit("-", 1)[-1])
+        count = int(running or env.get("WORKER_COUNT", "8"))
+        support = min(int(env.get("SUPPORT_WORKERS", "2")), count // 4)
+    except (TypeError, ValueError):
+        return "general"
+    return "support" if support > 0 and count - support < number <= count else "general"
+
+
+def refresh_worker_class():
+    """The number of running workers changes (scaler): re-derive the class."""
+    global WORKER_CLASS
+    try:
+        WORKER_CLASS = worker_class(running=redis.get("laika:scaler:target"))
+    except Exception:
+        pass
+
+
+WORKER_CLASS = worker_class()
+PICK_IDLE_SECONDS = float(os.environ.get("PICK_IDLE_SECONDS", "2"))
+AGING_POINTS_PER_MINUTE = float(os.environ.get("AGING_POINTS_PER_MINUTE", "0.5"))
+TIER_ORDER = {
+    "general": {"high": 0, "medium": 1, "low": 2},
+    "support": {"medium": 0, "low": 1, "high": 2},
+}
+IN_FLIGHT_ROLES = {"reviewer", "repair", "integrate"}
+
+
+def rank_key(payload, project_info, now, worker_class=None):
+    """Sort key for one ready job (lower runs first)."""
+    tiers = TIER_ORDER.get(worker_class or WORKER_CLASS, TIER_ORDER["general"])
+    importance, remaining = project_info
+    try:
+        created = float(payload.get("created_at") or now)
+    except (TypeError, ValueError):
+        created = now
+    waited_minutes = max(0.0, (now - created) / 60)
+    effort = (remaining if remaining is not None else 0.0) - AGING_POINTS_PER_MINUTE * waited_minutes
+    return (
+        tiers.get(importance, tiers["medium"]),
+        0 if payload.get("role") in IN_FLIGHT_ROLES else 1,
+        effort,
+        created,
+    )
+
+
+def project_info_for(payload, cache):
+    """(importance, remaining_effort) of a ready job's project, cached per pick."""
+    project_id = laika_projects.job_project_id(redis, payload)
+    if project_id not in cache:
+        try:
+            importance = laika_projects.load(redis, project_id).importance
+        except Exception:
+            importance = "medium"
+        try:
+            remaining = float(redis.hget(f"laika:project-stats:{project_id}", "remaining_effort") or 0)
+        except (TypeError, ValueError):
+            remaining = 0.0
+        cache[project_id] = (importance, remaining)
+    return cache[project_id]
+
+
+def pick_job(now=None):
+    """Claim the best ready job (raw payload) or None."""
+    now = time.time() if now is None else now
+    raw_items = redis.lrange(QUEUE_NAME, 0, -1)
+    if not raw_items:
+        return None
+    cache, ranked = {}, []
+    for raw in raw_items:
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        ranked.append((rank_key(payload, project_info_for(payload, cache), now), raw))
+    ranked.sort(key=lambda item: item[0])
+    for _, raw in ranked:
+        if redis.lrem(QUEUE_NAME, 1, raw) == 1:
+            return raw
+    return None
+
+
+def process_job(raw_job):
+    global CURRENT_JOB_ID, CURRENT_JOB_ROLE, CURRENT_JOB_STARTED_AT
+    try:
+        parsed = json.loads(raw_job)
+        CURRENT_JOB_ID = str(parsed.get("id", ""))
+        CURRENT_JOB_ROLE = str(parsed.get("role") or "builder")
+        job_key = f"laika:jobs:{CURRENT_JOB_ID}"
+        if redis.exists(job_key):
+            CURRENT_JOB_STARTED_AT = str(time.time())
+            redis.hset(job_key, "started_at", CURRENT_JOB_STARTED_AT)
+            redis.hdel(job_key, "finished_at")
+        else:
+            CURRENT_JOB_STARTED_AT = ""
+    except (ValueError, AttributeError):
+        CURRENT_JOB_ID = CURRENT_JOB_ROLE = CURRENT_JOB_STARTED_AT = ""
+    try:
+        # Publish the held job before touching its state, so the
+        # orchestrator never sees it claimed by nobody.
+        heartbeat("working")
+        with keep_alive("working"):
+            _process_job(raw_job)
+    finally:
+        if CURRENT_JOB_ID:
+            job_key = f"laika:jobs:{CURRENT_JOB_ID}"
+            if redis.exists(job_key):
+                redis.hset(job_key, "finished_at", str(time.time()))
+        CURRENT_JOB_ID = CURRENT_JOB_ROLE = CURRENT_JOB_STARTED_AT = ""
+        CURRENT_AGENT.clear()
+        use_project(None)
+        heartbeat("idle")
+
+
+def _process_job(raw_job):
+    job = json.loads(raw_job)
+    job_id = str(job["id"])
+    key = f"laika:jobs:{job_id}"
+
+    # Every path below belongs to the job's project (unknown project: fail
+    # the job rather than run it in the wrong repository).
+    try:
+        project = laika_projects.load(redis, laika_projects.job_project_id(redis, job))
+    except Exception as exc:
+        # A deleted project's records are gone: do not recreate them.
+        if redis.exists(key):
+            redis.hset(key, mapping={"status": "failed", "error": f"project unavailable: {exc}",
+                                     "updated_at": str(time.time())})
+        return
+    if project.status == "deleting":
+        # laika-project.py delete is removing this project; its queued work is
+        # being dropped, so never start it (or create its directories).
+        return
+    use_project(project)
+    redis.hsetnx(key, "project_id", project.id)
+    prepare_group_context()
+
+    LOG_ROOT.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_ROOT / f"{job_id}.jsonl"
+    test_log = LOG_ROOT / f"{job_id}-tests.log"
+
+    try:
+        heartbeat("working")
+
+        if job.get("role", "builder") == "reviewer":
+            process_review_job(job, key, log_path)
+            return
+
+        if job.get("role") == "integrate":
+            process_integrate_job(job, key)
+            return
+
+        if job.get("role") == "repair":
+            process_repair_job(
+                job,
+                key,
+                log_path,
+                test_log,
+            )
+            return
+
+        redis.hset(
+            key,
+            mapping={
+                "status": "claimed",
+                "worker_id": WORKER_ID,
+                "worker_role": WORKER_ROLE,
+                "job_role": job.get("role", "builder"),
+                "provider": job.get("provider", DEFAULT_PROVIDER),
+                "model": job.get("model", DEFAULT_MODEL),
+                "token_budget": str(job.get("token_budget") or role_limit("builder", "TOKEN_BUDGET", ROLE_TOKEN_DEFAULTS)),
+                "enforcement_budget": str(job.get("enforcement_budget") or role_limit("builder", "ENFORCEMENT_BUDGET", ROLE_ENFORCEMENT_DEFAULTS)),
+                "prompt_chars": str(len(job.get("prompt", ""))),
+                "timeout_seconds": str(job.get("timeout_seconds") or role_limit("builder", "TIMEOUT_SECONDS", ROLE_RUNTIME_DEFAULTS)),
+                "updated_at": str(time.time()),
+            },
+        )
+        # Marks the job as retry-eligible for the orchestrator; a retry
+        # dispatch has already set the next attempt number.
+        redis.hsetnx(key, "build_attempt", "1")
+
+        branch, worktree = create_worktree(job_id)
+
+        redis.hset(
+            key,
+            mapping={
+                "status": "running",
+                "branch": branch,
+                "worktree": str(worktree),
+                "log": str(log_path),
+                "updated_at": str(time.time()),
+            },
+        )
+
+        if best_of_enabled(job):
+            returncode, duration = run_best_of(job, worktree, log_path)
+        else:
+            returncode, duration = run_agent(job, worktree, log_path)
+        session_id, usage = parse_codex_log(log_path)
+
+        redis.hset(
+            key,
+            mapping={
+                "codex_exit_code": str(returncode),
+                "duration_seconds": f"{duration:.2f}",
+                "session_id": session_id,
+                "tokens": usage["total_tokens"],
+                "input_tokens": usage["input_tokens"],
+                "cached_input_tokens": usage["cached_input_tokens"],
+                "output_tokens": usage["output_tokens"],
+                "reasoning_tokens": usage["reasoning_tokens"],
+                "uncached_input_tokens": usage["uncached_input_tokens"],
+                "effective_tokens": usage["effective_tokens"],
+                "command_count": usage["command_count"],
+                "updated_at": str(time.time()),
+            },
+        )
+
+        if returncode != 0:
+            raise RuntimeError(f"Codex exited with status {returncode}")
+
+        redis.hset(key, mapping={"status": "testing"})
+
+        tests_ok, tests_output = run_tests(worktree, network=gate_network(job_id))
+        test_log.write_text(tests_output)
+        redis.hset(key, mapping={"test_status": "passed" if tests_ok else "failed"})
+
+        if not tests_ok:
+            note_network_need(job_id, tests_output, "tests", agent_final_text(log_path))
+            redis.hset(
+                key,
+                mapping={
+                    "status": "test_failed",
+                    "test_log": str(test_log),
+                    "updated_at": str(time.time()),
+                },
+            )
+            return
+
+        diff = run_git("status", "--porcelain", cwd=worktree).stdout
+
+        if not diff.strip():
+            redis.hset(
+                key,
+                mapping={
+                    "status": "completed_no_changes",
+                    "test_log": str(test_log),
+                    "changes": "",
+                    "updated_at": str(time.time()),
+                },
+            )
+
+            run_git("worktree", "remove", str(worktree))
+            run_git("branch", "-D", branch)
+
+            print(
+                f"[{WORKER_ID}] job={job_id} completed with no changes",
+                flush=True,
+            )
+            return
+
+        run_git("add", "-A", cwd=worktree)
+        run_git(
+            "commit",
+            "-m",
+            f"Apply LAIka job {job_id}",
+            cwd=worktree,
+        )
+        candidate_commit = run_git(
+            "rev-parse", "HEAD", cwd=worktree
+        ).stdout.strip()
+
+        if run_git("status", "--porcelain", cwd=worktree).stdout.strip():
+            raise RuntimeError("Candidate worktree is dirty after commit")
+
+        redis.hset(
+            key,
+            mapping={
+                "status": "awaiting_review",
+                "test_log": str(test_log),
+                "changes": diff,
+                "files_changed": str(len([x for x in diff.splitlines() if x.strip()])),
+                "candidate_commit": candidate_commit,
+                "source_candidate_commits": json.dumps([candidate_commit], separators=(",", ":")),
+                "updated_at": str(time.time()),
+            },
+        )
+
+        if not prepare_integration(job_id):
+            print(
+                f"[{WORKER_ID}] job={job_id} integration FAILED",
+                flush=True,
+            )
+            return
+
+        try:
+            review_job_id, queued = queue_review_job(job_id)
+        except Exception as exc:
+            redis.hset(
+                key,
+                mapping={
+                    "review_status": "queue_failed",
+                    "review_error": str(exc),
+                    "updated_at": str(time.time()),
+                },
+            )
+            print(
+                f"[{WORKER_ID}] job={job_id} review queue FAILED: {exc}",
+                flush=True,
+            )
+            return
+
+        print(
+            f"[{WORKER_ID}] job={job_id} review={review_job_id} "
+            f"{'queued' if queued else 'already queued'}",
+            flush=True,
+        )
+
+    except Exception as exc:
+        redis.hset(
+            key,
+            mapping={
+                "status": "failed",
+                "error": str(exc),
+                "updated_at": str(time.time()),
+            },
+        )
+
+        if job.get("role", "builder") == "repair":
+            target_builder_id = str(
+                job.get("target_builder_id", "")
+            )
+            if target_builder_id:
+                redis.hset(
+                    f"laika:jobs:{target_builder_id}",
+                    mapping={
+                        "repair_status": "failed",
+                        "repair_error": str(exc),
+                        "updated_at": str(time.time()),
+                    },
+                )
+                redis.hdel(
+                    f"laika:jobs:{target_builder_id}",
+                    "repair_job_id",
+                )
+
+        if job.get("role", "builder") == "reviewer":
+            builder_job_id = str(job.get("builder_job_id", ""))
+            if builder_job_id:
+                redis.hset(
+                    f"laika:jobs:{builder_job_id}",
+                    mapping={
+                        "review_status": "failed",
+                        "review_error": str(exc),
+                        "updated_at": str(time.time()),
+                    },
+                )
+
+        print(f"[{WORKER_ID}] job={job_id} FAILED: {exc}", flush=True)
+
+    finally:
+        # process_job owns the heartbeat/job lifecycle cleanup so that timing
+        # is recorded even when the handler raises unexpectedly.
+        pass
+
+
+def main():
+    # Shared SDKs (project_sandbox.TOOLCHAINS) on PATH for agents and gates.
+    extra = [p for p in project_sandbox.toolchain_paths() if p not in os.environ.get("PATH", "").split(os.pathsep)]
+    if extra:
+        os.environ["PATH"] = os.pathsep.join(extra + [os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")])
+    print(
+        f"LAIka worker starting: {WORKER_ID} "
+        f"role={WORKER_ROLE} "
+        f"default={DEFAULT_PROVIDER}/{DEFAULT_MODEL}",
+        flush=True,
+    )
+
+    heartbeat()
+
+    while True:
+        try:
+            heartbeat()
+
+            # An operator stop, a scaler drain or a memory hold takes effect
+            # between jobs: the current job always finishes, and no new job
+            # is claimed while paused.
+            if pause_reason():
+                time.sleep(5)
+                continue
+            refresh_worker_class()
+
+            raw_job = pick_job()
+
+            if raw_job:
+                process_job(raw_job)
+            else:
+                time.sleep(PICK_IDLE_SECONDS)
+
+        except KeyboardInterrupt:
+            break
+        except Exception as exc:
+            print(f"Worker error: {exc}", flush=True)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,23 @@
+[Unit]
+Description=LAIka: keep project apps running (laika-app-<id> units)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+User=root
+# Root for units, Docker and firewall rules; files it creates in LAIka's
+# shared data stay usable by the laika group (services/laika_user.py).
+UMask=0007
+Environment=GIT_CONFIG_GLOBAL=/etc/laika/gitconfig
+Type=simple
+WorkingDirectory=/opt/laika
+Environment=PYTHONUNBUFFERED=1
+Environment=REDIS_URL=redis://127.0.0.1:6379/0
+ExecStart=/var/lib/laika/venv/bin/python /opt/laika/services/apps/laika_apps.py
+Restart=always
+RestartSec=5
+# Stopping this service leaves the apps running (they are their own units).
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
