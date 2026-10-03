@@ -120,14 +120,78 @@ def test_provider_helper_reads_cli_output_without_leaking_details():
     assert helper.codex_status(missing)["installed"] is False
 
 
-def test_a_claude_sign_in_is_judged_by_the_cli_afterwards(monkeypatch):
-    helper = load_module(ROOT / "scripts/laika-providers.py", "laika_providers_finish_test")
-    r = MemoryRedis()
+def test_claude_sign_in_saves_a_working_token_and_never_shows_one(tmp_path, monkeypatch):
+    helper = load_module(ROOT / "scripts/laika-providers.py", "laika_providers_token_test")
+    monkeypatch.setattr(helper, "SIGNIN_LOG", tmp_path / "signin.log")
     monkeypatch.setattr(helper, "status", lambda r, runner=None: {})
-    assert helper.finish_claude(r, 0, "", check=lambda: {"signed_in": True}) == 0
-    assert json.loads(r.get("laika:provider-login:claude"))["state"] == "done"
-    # Exit code lost or non-zero, but the CLI is signed in: still a success.
-    assert helper.finish_claude(r, 1, "", check=lambda: {"signed_in": True}) == 0
-    assert helper.finish_claude(r, 1, "\x1b[1mInvalid code\x1b[0m", check=lambda: {"signed_in": False}) == 1
-    failed = json.loads(r.get("laika:provider-login:claude"))
-    assert failed["state"] == "failed" and failed["message"] == "Invalid code"
+    r = MemoryRedis()
+    r.values["laika:provider-cooldown:claude"] = "claude unavailable"
+    for token in ("sk-ant-oat01-" + "A1b2_C3-d4" * 9, "sk-ant-at01-" + "Zz9_-" * 18):
+        # As the CLI drew it: cursor moves for spaces, colours, odd control codes.
+        output = ("\x1b[?25l\x1b[1CSigned\x1b[1Cin!\x1b[1CYour\x1b[1COAuth\x1b[1Ctoken:\r\n" + token
+                  + "\r\nStore\x1b[1Cthis\x1b[1Ctoken\x1b[>4m\x1b[<u\x1b(B\x1b7\x1b8\r\n")
+        saved, tested = [], []
+        assert helper.finish_claude(r, 0, output, saver=saved.append, tester=lambda t: tested.append(t) or True) == 0
+        assert saved == [token] and tested == [token]
+        stored = json.dumps(r.values) + json.dumps(r.records)
+        assert token not in stored and "sk-ant" not in stored
+        log = (tmp_path / "signin.log").read_text()
+        assert token not in log and "[token]" in log
+        assert f"type {token.split('-')[2]}, {len(token)} characters" in log
+    assert r.get("laika:provider-cooldown:claude") is None
+    # A token Claude does not accept is not saved.
+    saved = []
+    assert helper.finish_claude(r, 0, "x sk-ant-at01-" + "q" * 40, saver=saved.append, tester=lambda t: False) == 1
+    assert saved == [] and "did not accept" in json.loads(r.get("laika:provider-login:claude"))["message"]
+    # No token: a plain failure message, never the CLI's own output.
+    assert helper.finish_claude(r, 1, "\x1b[31mInvalid code sk-ant-partial\x1b[39m", saver=saved.append) == 1
+    message = json.loads(r.get("laika:provider-login:claude"))["message"]
+    assert message == helper.FAILED and "sk-ant" not in message
+    path = tmp_path / ".config/laika/claude-token"
+    helper.save_token("sk-ant-at01-" + "w" * 40, path)
+    assert oct(path.stat().st_mode)[-3:] == "600"
+
+
+def test_claude_runs_use_the_saved_token(tmp_path, monkeypatch):
+    agent_cli = load_module(ROOT / "services/agent_cli.py", "agent_cli_token_test")
+    assert agent_cli.claude_token(tmp_path) == ""
+    (tmp_path / ".config/laika").mkdir(parents=True)
+    (tmp_path / ".config/laika/claude-token").write_text("not a token\n")
+    assert agent_cli.claude_token(tmp_path) == ""
+    for token in ("sk-ant-oat01-" + "x" * 40, "sk-ant-at01-" + "y" * 40):
+        (tmp_path / ".config/laika/claude-token").write_text(token + "\n")
+        assert agent_cli.claude_token(tmp_path) == token
+
+
+def test_sign_in_transcripts_never_keep_the_token(tmp_path):
+    helper = load_module(ROOT / "scripts/laika-providers.py", "laika_providers_log_test")
+    token = "sk-ant-at01-" + "Z" * 50
+    helper.keep_transcript("Your\x1b[1Ctoken:\r\n" + token + "\r\n", tmp_path / "log")
+    text = (tmp_path / "log").read_text()
+    assert token not in text and "[token]" in text and "Your token:" in text
+
+
+def test_the_token_is_read_from_the_rendered_screen(tmp_path, monkeypatch):
+    """The CLI skips cells that already show the right character; only the
+    rendered screen has the whole token (the bug: an 'o' went missing)."""
+    helper = load_module(ROOT / "scripts/laika-providers.py", "laika_providers_screen_test")
+    token = "sk-ant-oat01-" + "Q7w_" * 23
+    # Frame 1 leaves "o" in column 8; frame 2 skips over it with a cursor move.
+    output = "\x1b[2J\x1b[H       o\r\n" + "\x1b[H" + "sk-ant-\x1b[1C" + token[8:] + "\r\n"
+    assert helper.token_candidates(output)[0] == token
+    saved = []
+    monkeypatch.setattr(helper, "SIGNIN_LOG", tmp_path / "log")
+    monkeypatch.setattr(helper, "status", lambda r, runner=None: {})
+    assert helper.finish_claude(MemoryRedis(), 0, output, saver=saved.append, tester=lambda t: t == token) == 0
+    assert saved == [token]
+
+
+def test_sign_in_waits_for_a_cli_that_is_updating(monkeypatch):
+    helper = load_module(ROOT / "scripts/laika-providers.py", "laika_providers_wait_test")
+    import shutil
+    seen = iter([None, None, "/usr/local/bin/claude"])
+    monkeypatch.setattr(shutil, "which", lambda name: next(seen))
+    assert helper.wait_for_cli("claude", sleep=lambda s: None) is True
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    times = iter(range(0, 1000, 50))
+    assert helper.wait_for_cli("claude", seconds=120, clock=lambda: next(times), sleep=lambda s: None) is False
