@@ -101,9 +101,13 @@ def test_setup_code_and_password_reset(capsys):
     r.records["laika:sessions:s1"] = {"user": "alex"}
     assert admin.main(["x", "reset-password"], r) == 0
     out = capsys.readouterr().out
-    assert "user: alex" in out and r.records["laika:auth:admin"]["password"].startswith("scrypt$")
+    # The 1.0 administrator became the first user account.
+    assert "user: alex" in out and r.records["laika:users:alex"]["password"].startswith("scrypt$")
+    assert r.records["laika:users:alex"]["role"] == "admin" and "laika:auth:admin" not in r.records
     assert "laika:sessions:s1" not in r.records
     assert admin.main(["x", "setup-code"], r) == 1  # an administrator exists
+    assert admin.main(["x", "reset-password", "nobody"], r) == 1
+    assert admin.main(["x", "reset-password", "ALEX"], r) == 0  # any capitals
 
 
 def test_provider_helper_reads_cli_output_without_leaking_details():
@@ -195,3 +199,17 @@ def test_sign_in_waits_for_a_cli_that_is_updating(monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name: None)
     times = iter(range(0, 1000, 50))
     assert helper.wait_for_cli("claude", seconds=120, clock=lambda: next(times), sleep=lambda s: None) is False
+
+
+def test_a_revoked_token_shows_as_not_signed_in():
+    import subprocess
+    helper = load_module(ROOT / "scripts/laika-providers.py", "laika_providers_revoked_test")
+    token = "sk-ant-oat01-" + "r" * 60
+    def runner(argv, **kwargs):
+        if argv[:2] == ["claude", "-p"]:
+            return subprocess.CompletedProcess(argv, 1, json.dumps({"is_error": True, "result": "OAuth token revoked"}), "")
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"loggedIn": True}), "")
+    info = helper.claude_status(runner, token=token)
+    assert info["signed_in"] is False and "sign in again" in info["method"]
+    good = lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, json.dumps({"is_error": False, "result": "OK", "loggedIn": True}), "")
+    assert helper.claude_status(good, token=token)["signed_in"] is True
