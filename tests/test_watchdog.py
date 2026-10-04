@@ -191,6 +191,13 @@ def test_expected_workers_follow_the_scaler(wd):
     r.values["laika:scaler:target"] = "3"
     report = run(wd, r)
     units = next(c for c in report["checks"] if c["name"] == "units")
-    assert units["level"] == "ok" and units["detail"] == "6 units active"  # 3 services + 3 workers
+    assert units["level"] == "ok" and units["detail"] == "7 units active"  # 4 services (incl. SFTP) + 3 workers
     assert next(c for c in report["checks"] if c["name"] == "heartbeats")["level"] == "ok"
     assert wd.expected_workers(type("R", (), {"get": lambda self, k: None})()) == wd.EXPECTED_WORKERS
+
+
+def test_a_release_install_without_git_is_not_a_dirty_live_tree(tmp_path):
+    module = load_module(ROOT / "scripts/laika-watchdog.py", "laika_watchdog_release")
+    never = lambda *a, **k: (_ for _ in ()).throw(AssertionError("git must not run"))
+    result = module.check_live_tree(never, root=str(tmp_path))
+    assert result["level"] == "ok" and "release install" in result["detail"]

@@ -28,6 +28,7 @@ SECTIONS = [
     ("ai", "AI & pipeline", "Which AI does what, how much it may spend and how hard LAIka tries."),
     ("workers", "Workers", "How many jobs run at the same time."),
     ("projects", "Project defaults", "Starting values for new projects, apps, previews and builds."),
+    ("sftp", "SFTP server", "Edit project files with an SFTP app (WinSCP, FileZilla, VS Code), signed in as yourself."),
     ("backups", "Backups & upkeep", "Backups, restore checks and cleaning up old data."),
     ("health", "Health checks", "When the watchdog warns you."),
 ]
@@ -54,6 +55,14 @@ FIELDS = [
     _f("UPDATE_URL", "general", "Update address", "str", "",
        "Where releases are published. Empty: the address this edition ships with.", apply="restart",
        max_length=300, pattern=r"^(https://\S+)?$"),
+    # --- SFTP (services/sftp/laika_sftp.py) ------------------------------------------------------
+    _f("SFTP_ENABLED", "sftp", "SFTP access", "bool", "true",
+       "Lets people sign in with an SFTP app using their LAIka username and password (or an SSH key)."),
+    _f("SFTP_PORT", "sftp", "SFTP port", "int", 2222,
+       "On Fedora / RHEL, run `sudo laika repair` after changing it so the firewall lets it in.", min=1024, max=65535),
+    _f("SFTP_COMMIT_SECONDS", "sftp", "Commit code changes after (seconds)", "int", 30,
+       "Code changes over SFTP become one commit on main this long after the last change (or when you disconnect).",
+       min=10, max=300),
     # --- appearance ----------------------------------------------------------------------
     _f("THEME", "appearance", "Theme", "choice", "system", "System follows the device's light or dark mode.",
        apply="live", choices=["system", "dark", "light"]),
@@ -98,10 +107,19 @@ FIELDS = [
     _f("REPAIR_TIMEOUT_SECONDS", "ai", "Repair time limit (seconds)", "int", 600, min=120, max=14400),
     _f("REVIEWER_TIMEOUT_SECONDS", "ai", "Review time limit (seconds)", "int", 240, min=60, max=7200),
     _f("PLAN_TIMEOUT", "ai", "Planning time limit (seconds)", "int", 180, min=60, max=3600),
+    _f("PLAN_DIAGNOSE_TIMEOUT", "ai", "Planning time limit for problems (seconds)", "int", 420,
+       "Goals that report a bug or error are diagnosed first: the planner reads the code and recent failures.",
+       min=120, max=3600),
+    _f("PLANNER_MAX_JOB_FILES", "ai", "Most files per job", "int", 6,
+       "Bigger jobs are sent back to the planner once to be split (tests do not count).", min=2, max=30),
     _f("MAX_CONCURRENT_GOALS", "ai", "Goals planned at the same time", "int", 4, min=1, max=20),
     _f("ASSIST_MODEL", "ai", "Goal assistant model", "str", "claude-haiku-4-5-20251001",
-       "The quick model behind 'Plan it with me'.", max_length=80, pattern=r"^[A-Za-z0-9._:-]+$"),
+       "The quick model behind the goal box's Questionnaire.", max_length=80, pattern=r"^[A-Za-z0-9._:-]+$"),
     _f("ASSIST_BUDGET_USD", "ai", "Goal assistant cap per turn ($)", "float", 0.30, min=0.05, max=5),
+    _f("ASSIST_CHAT_MODEL", "ai", "Goal box Conversation model", "str", "sonnet",
+       "The model you discuss ideas with in the goal box (a Claude model name or alias).", max_length=80,
+       pattern=r"^[A-Za-z0-9._:-]+$"),
+    _f("ASSIST_CHAT_BUDGET_USD", "ai", "Goal box Conversation cap per reply ($)", "float", 0.50, min=0.05, max=5),
     # --- workers -------------------------------------------------------------------------
     # The scaler (services/scaler/laika_scaler.py) reads these every 15 s.
     _f("AUTOSCALE", "workers", "Automatic scaling", "bool", "true",

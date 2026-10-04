@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import re
 import os
 import pwd
 import subprocess
@@ -31,6 +32,21 @@ DEFAULT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "codex")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-5.6-luna")
 ORCHESTRATOR_ID = os.getenv("ORCHESTRATOR_ID", "laika-orchestrator-01")
 PLAN_TIMEOUT = int(os.getenv("PLAN_TIMEOUT", "180"))
+# A goal that reports a problem is diagnosed first: the planner reads code and
+# recent failures, which takes longer (and may cost a little more).
+DIAGNOSE_TIMEOUT = int(os.getenv("PLAN_DIAGNOSE_TIMEOUT", "420"))
+PROBLEM_WORDS = re.compile(
+    r"\b(bug|bugs|fix|fixes|broken|break|breaks|error|errors|crash|crashes|crashing|fail|fails|failing|failed|"
+    r"exception|traceback|wrong|incorrect|issue|issues|regression|diagnose|debug|why|slow|hangs|freezes|stuck|"
+    r"doesn'?t|does not|isn'?t|won'?t|can'?t|cannot|not working|no longer|500|404)\b", re.IGNORECASE)
+
+
+def reports_problem(goal):
+    return bool(PROBLEM_WORDS.search(goal or ""))
+
+
+def plan_timeout(goal):
+    return DIAGNOSE_TIMEOUT if reports_problem(goal) else PLAN_TIMEOUT
 PLANNER_LOG_ROOT = Path(os.getenv("PLANNER_LOG_ROOT", "/var/log/laika/planner"))
 MAX_REPAIR_ATTEMPTS = int(
     os.getenv("MAX_REPAIR_ATTEMPTS", "2")
@@ -156,20 +172,25 @@ High-level goal:
 
 ATOMIC MODE: {"ENABLED" if atomic else "disabled"}
 
-Plan from the goal and the compact repository manifest below. Do not broadly inspect the repository unless a specific ambiguity prevents a safe plan.
+{diagnose_rules(goal)}
 
 Repository manifest:
 {repository_manifest(project.repo)}
-
+{recent_problems(project) if reports_problem(goal) else ""}
 Break the goal into a SMALL set of implementation jobs that can be executed
 by independent coding agents.
 
 Rules:
 - Do not modify files.
 - If ATOMIC MODE is enabled, return exactly one implementation job with no dependencies.
-- Without atomic mode, use one job for a narrow independently-testable change; split only when there is a concrete dependency or separable ownership boundary.
-- Prefer 1-5 coherent jobs.
-- Avoid microscopic jobs.
+- Without atomic mode, a narrow change stays one job. Anything bigger is split
+  so that EVERY job can be reviewed thoroughly in one pass: one concern (one
+  module, screen, endpoint group or subsystem) and at most {MAX_JOB_FILES} files
+  created or changed, not counting tests. A whole server, client, app or game
+  is never one job: split it by module (for a game server e.g. protocol, game
+  rules, rooms/matchmaking, bots, HTTP/static serving), with depends_on where
+  one part needs another. Prefer 2-8 jobs for a feature-sized goal.
+- Avoid microscopic jobs (one trivial line each); size them S or M.
 - Minimize overlapping file ownership between parallel jobs.
 - "scope" must list every file the job will create or change (exact paths;
   a directory only when the job adds new files inside it). LAIka schedules by
@@ -179,9 +200,9 @@ Rules:
 {laika_rules}- Files currently being changed by other in-flight jobs (work touching them
   will wait until they finish):
 {busy_files_summary(project.id)}
-- "size" is your effort estimate for the job: S (a small, local change),
-  M (a normal feature or fix), L (large or cross-cutting). LAIka schedules by
-  remaining effort, so estimate honestly.
+- "size" is your effort estimate for the job: S (a small, local change) or
+  M (a normal feature or fix). There is no L: work that large must be split
+  into S/M jobs. LAIka schedules by remaining effort, so estimate honestly.
 - Dependencies must reference job numbers from this plan.
 - Every job must be independently testable.
 - Existing LAIka review and human approval gates will handle merging.
@@ -200,12 +221,103 @@ Return ONLY valid JSON using this exact shape:
       "title": "short title",
       "task": "complete implementation instructions",
       "scope": ["exact/file/it/will/change.py"],
-      "size": "S|M|L",
+      "size": "S|M",
       "depends_on": []
     }}
   ]
 }}
 """.strip()
+
+
+MAX_JOB_FILES = int(os.getenv("PLANNER_MAX_JOB_FILES", "6"))
+
+
+def _is_test_path(path):
+    name = path.rsplit("/", 1)[-1].lower()
+    parts = path.lower().split("/")
+    return (any(part in ("test", "tests", "__tests__", "spec") for part in parts[:-1])
+            or name.startswith("test_") or ".test." in name or ".spec." in name or name.endswith("_test.py")
+            or name.endswith("_test.go"))
+
+
+def oversized_jobs(plan, atomic=False):
+    """[(number, why)] for jobs too big to review in one pass (size L, or
+    more than MAX_JOB_FILES non-test files). Atomic plans are never split."""
+    if atomic or not isinstance(plan, dict):
+        return []
+    found = []
+    for job in plan.get("jobs") or []:
+        if not isinstance(job, dict):
+            continue
+        scope = [p for p in job.get("scope") or [] if isinstance(p, str) and not _is_test_path(p)]
+        if str(job.get("size", "")).upper() == "L":
+            found.append((job.get("number"), "sized L"))
+        elif len(scope) > MAX_JOB_FILES:
+            found.append((job.get("number"), f"{len(scope)} files"))
+    return found
+
+
+def split_feedback(plan, issues):
+    titles = {job.get("number"): job.get("title", "") for job in plan.get("jobs") or [] if isinstance(job, dict)}
+    listed = "; ".join(f"job {number} \"{titles.get(number, '')}\" ({why})" for number, why in issues)
+    return (f"\n\nPLANNER FEEDBACK: your previous plan had jobs too big to review in one pass: {listed}. "
+            f"Return the whole plan again with those jobs split into S/M jobs of at most {MAX_JOB_FILES} files "
+            "each (tests not counted), one concern per job, with depends_on between them.")
+
+
+def diagnose_rules(goal):
+    if not reports_problem(goal):
+        return ("Plan from the goal and the compact repository manifest below. Do not broadly inspect the "
+                "repository unless a specific ambiguity prevents a safe plan.")
+    return """This goal reports a problem. DIAGNOSE BEFORE YOU PLAN:
+1. Read the code involved (Read / Grep / Glob; your working directory is the
+   project at its latest main) and the recent problems listed below, until you
+   can name the most likely cause with evidence: file:line and what goes wrong.
+   Follow the actual code path; do not guess from file names.
+2. Plan the fix for THAT cause. In each job's task, state the cause and the
+   evidence, the fix, and a test that fails before the fix and passes after it
+   (a regression test), so the reviewer can check the right thing.
+3. If you cannot pin the cause down, make job 1 "Find and fix the cause of ...":
+   list your hypotheses, most likely first, with what to check for each, and
+   require the builder to reproduce it with a failing test first.
+4. Fix the cause, not the symptom; do not rewrite unrelated code.
+Keep the investigation focused (roughly 10-30 lookups)."""
+
+
+def recent_problems(project, limit=6, days=7):
+    """What went wrong lately in this project (app crashes, failed and stuck
+    jobs), for diagnosing a problem goal. Short; no secrets (errors and the
+    app's own log lines only)."""
+    lines = []
+    app = r.hgetall(f"laika:app-status:{project.id}") or {}
+    if app.get("state") and app.get("state") != "running":
+        lines.append(f"- App: {app.get('state')}" + (f": {app.get('error')[:300]}" if app.get("error") else ""))
+    if app.get("log"):
+        tail = "\n".join(app["log"].splitlines()[-15:])[:1500]
+        lines.append("- App log (last lines):\n" + "\n".join("    " + line for line in tail.splitlines()))
+    cutoff = time.time() - days * 86400
+    failed = []
+    for key in r.scan_iter("laika:jobs:*"):
+        if key.count(":") != 2:
+            continue
+        job = r.hgetall(key)
+        if (job.get("project_id") or laika_projects.BUILTIN_PROJECT) != project.id:
+            continue
+        if job.get("status") not in ("failed", "test_failed", "integration_failed", "needs_human"):
+            continue
+        try:
+            when = float(job.get("updated_at") or job.get("created_at") or 0)
+        except ValueError:
+            when = 0
+        if when >= cutoff:
+            failed.append((when, job))
+    for _, job in sorted(failed, key=lambda item: -item[0])[:limit]:
+        why = (job.get("error") or job.get("needs_human_reason") or job.get("review_findings") or "").strip()
+        lines.append(f"- Job \"{(job.get('title') or job.get('id', ''))[:80]}\" {job.get('status')}: "
+                     + (why.splitlines()[0][:300] if why else "(no message)"))
+    if not lines:
+        return "\nRecent problems in this project: none recorded.\n"
+    return "\nRecent problems in this project (newest first):\n" + "\n".join(lines) + "\n"
 
 
 def group_planner_prompt(goal, atomic, project, members):
@@ -255,14 +367,14 @@ def run_planner(goal, atomic=False, info=None, project=None):
         log_path = PLANNER_LOG_ROOT / f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}.json"
         slot = f"planner:{log_path.stem}"
         if not agent_cli.wait_for_claude_slot(
-                r, slot, PLAN_TIMEOUT + 60, int(os.getenv("PLANNER_SLOT_WAIT_SECONDS", "300"))):
+                r, slot, plan_timeout(goal) + 60, int(os.getenv("PLANNER_SLOT_WAIT_SECONDS", "300"))):
             info["fallback"] = "claude at capacity (CLAUDE_MAX_CONCURRENT)"
             info.update(provider="codex", model=DEFAULT_MODEL)
             return run_codex_planner(goal, atomic, project)
         try:
             run = agent_cli.run_claude(
                 "planner", planner_prompt(goal, atomic=atomic, project=project),
-                project.repo, log_path, PLAN_TIMEOUT, model=planner_model(atomic),
+                project.repo, log_path, plan_timeout(goal), model=planner_model(atomic),
                 wrap=lambda argv: project_sandbox.command(argv, project, project.repo, kind="agent", writable=False))
         finally:
             agent_cli.release_claude_slot(r, slot)
@@ -303,7 +415,7 @@ def run_codex_planner(goal, atomic=False, project=None):
         input=planner_prompt(goal, atomic=atomic, project=project),
         text=True,
         capture_output=True,
-        timeout=PLAN_TIMEOUT,
+        timeout=plan_timeout(goal),
         env={**os.environ, "HOME": os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir},
     )
 
@@ -569,16 +681,62 @@ Efficiency requirements:
 - Stop when the requested implementation and focused validation are complete.
 """.strip() + goal_section(goal, jobs_in_plan)
 
+PLANNING_NOW = set()  # goal ids this process is planning right now
+MAX_PLAN_RESTARTS = 2
+LAST_PLAN_RECOVERY = [0.0]
+
+
+def recover_interrupted_planning(startup=False):
+    """A goal left in "planning" by a restart or crash (its planner died with
+    the process, and its queue entry was already taken) is queued again. At
+    startup that is every planning goal this orchestrator had claimed; later,
+    any planning goal whose claim has expired. After MAX_PLAN_RESTARTS it
+    fails visibly instead of looping."""
+    for key in r.scan_iter("laika:goals:*"):
+        if key.count(":") != 2 or key.endswith(":planning"):
+            continue
+        goal_id = key.rsplit(":", 1)[-1]
+        if goal_id in PLANNING_NOW or r.hget(key, "status") != "planning" or r.hget(key, "jobs"):
+            continue
+        owner = r.get(f"{key}:planning")
+        if owner and not (startup and owner == ORCHESTRATOR_ID):
+            continue  # still being planned (here or by another orchestrator)
+        goal = r.hgetall(key)
+        restarts = int(goal.get("plan_restarts") or 0) + 1
+        r.delete(f"{key}:planning")
+        if restarts > MAX_PLAN_RESTARTS:
+            r.hset(key, mapping={"status": "planning_failed", "updated_at": now(),
+                                 "error": "planning was interrupted several times (restarts); submit the goal again"})
+            continue
+        r.hset(key, mapping={"status": "queued", "plan_restarts": str(restarts), "updated_at": now(),
+                             "note": "planning was interrupted by a restart; planning again"})
+        queued = {"id": goal_id, "goal": goal.get("goal") or goal.get("prompt") or "",
+                  "atomic": str(goal.get("atomic", "")).lower() in {"1", "true", "yes"}}
+        if goal.get("project_id"):
+            queued["project_id"] = goal["project_id"]
+        r.rpush(GOAL_QUEUE, json.dumps(queued))
+        print(f"[{ORCHESTRATOR_ID}] goal {goal_id}: planning was interrupted; queued again ({restarts})", flush=True)
+
+
 def process_goal(raw):
     data = json.loads(raw)
     goal_id = data["id"]
+    PLANNING_NOW.add(goal_id)
+    try:
+        return _process_goal(raw, data, goal_id)
+    finally:
+        PLANNING_NOW.discard(goal_id)
+
+
+def _process_goal(raw, data, goal_id):
     goal = data["goal"]
     key = f"laika:goals:{goal_id}"
 
     # Queue delivery is at-least-once. A short-lived claim prevents a retry or
     # a second orchestrator from creating a second plan for the same goal.
     claim_key = f"{key}:planning"
-    if not r.set(claim_key, ORCHESTRATOR_ID, nx=True, ex=PLAN_TIMEOUT + 30):
+    # Long enough for a diagnosis and one re-plan.
+    if not r.set(claim_key, ORCHESTRATOR_ID, nx=True, ex=2 * max(PLAN_TIMEOUT, DIAGNOSE_TIMEOUT) + 60):
         return
 
     existing_status = r.hget(key, "status")
@@ -603,6 +761,17 @@ def process_goal(raw):
     project = laika_projects.load(r, data.get("project_id") or r.hget(key, "project_id"))
     planner = {}
     plan = run_planner(goal, atomic=atomic, info=planner, project=project)
+    issues = oversized_jobs(plan, atomic)
+    if issues:
+        # One more try with the reasons; a second big plan is used as it is.
+        print(f"[{ORCHESTRATOR_ID}] goal {goal_id}: re-planning, oversized jobs {issues}", flush=True)
+        try:
+            again = run_planner(goal + split_feedback(plan, issues), atomic=atomic, info=planner, project=project)
+            if isinstance(again, dict) and again.get("jobs"):
+                plan = again
+                r.hset(key, "replanned", f"split {len(issues)} oversized job(s)")
+        except Exception as exc:
+            print(f"[{ORCHESTRATOR_ID}] goal {goal_id}: re-plan failed, using the first plan: {exc}", flush=True)
     members = {member.id: member for member in laika_projects.group(r, project)}
     jobs = validate_plan(plan, atomic=atomic, members=list(members) if len(members) > 1 else None)
 
@@ -1595,6 +1764,10 @@ def main():
     )
 
     futures = set()
+    try:
+        recover_interrupted_planning(startup=True)
+    except Exception as exc:
+        print(f"[{ORCHESTRATOR_ID}] planning recovery: {exc}", flush=True)
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_GOALS) as executor:
         while True:
             try:
@@ -1611,6 +1784,9 @@ def main():
                 queue_repairs()
                 release_dependencies()
                 update_goals()
+                if time.time() - LAST_PLAN_RECOVERY[0] > 30:
+                    LAST_PLAN_RECOVERY[0] = time.time()
+                    recover_interrupted_planning()
                 submit_queued_goals(executor, futures)
 
                 ids = active_goal_ids()

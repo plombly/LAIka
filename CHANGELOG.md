@@ -2,6 +2,70 @@
 
 All notable changes to LAIka. Versions follow [semantic versioning](https://semver.org).
 
+## 1.3.0
+
+- **Needs you on every project page.** Changes ready to approve and stuck
+  jobs of a project (and its child projects) show at the top of its page,
+  with the same Approve / Preview / Reject / Try again buttons as the home
+  page.
+- **Apps start without a run command.** When a project's run command is
+  empty, LAIka runs what its code implies: `npm start`, a Procfile's `web:`
+  line, Django's `manage.py`, or a Python server that reads `PORT`. Settings
+  shows what it detected; type `off` to never run it. (A finished game used
+  to sit there unplayable because nobody had set its run command.)
+- - **Problems are diagnosed before they are planned.** A goal that reports a
+  bug, error, crash or "why…" makes the planner read the code involved and
+  the project's recent failures (app crashes and logs, failed and stuck
+  jobs) until it can name the likely cause with evidence. Each job then
+  says the cause, the fix and a regression test; if the cause stays
+  unclear, the first job is "find and fix the cause" with ranked
+  hypotheses. Time limit in Settings → AI (7 minutes by default).
+- **Smaller jobs.** The planner keeps every job reviewable in one pass: one
+  concern and at most 6 files (tests not counted). A plan with a bigger job
+  is sent back once to be split. Big jobs used to bounce between review and
+  repair, each review finding something new.
+- **Approve all merged nothing on release installs.** The merge queue
+  walked every project and stopped at the first one whose folder is not a
+  git checkout (LAIka's own, on an install from a release), so no queued
+  change was ever merged. Each project's queue now runs on its own, and
+  approved changes waiting in the queue say so instead of showing Approve.
+- **Planning survives restarts.** A goal whose planning was cut off by a
+  restart (an update, `laika repair`, a crash) stayed "planning" forever.
+  The orchestrator now plans it again (twice at most, then it says so).
+- Job details: **Close** works again (and Esc, and leaving the page).
+- Releases no longer show red health for "live tree" (it only applies to
+  git checkouts), which also pinged the health notification.
+- The dashboard's refresh no longer wipes a text selection, typing or a
+  click.
+
+- **Conversation.** The goal box has a third way in: an open conversation
+  with Claude about the project. The goal box's three buttons now say what
+  they do: **Send as written**, **Questionnaire** (the former "Plan it with
+  me": up to three quick questions, then a goal to check) and
+  **Conversation**. Discuss changes and additions, ask what
+  could be better, and get suggestions you had not thought of; Claude reads
+  the project's code to make its answers concrete. **Write the goal** turns
+  the conversation into the usual editable brief, and you can keep talking
+  after that. Nothing is built until you start a goal. The model (Sonnet by
+  default) and the cost cap per reply are in Settings → AI.
+
+- **SFTP.** Edit project files with WinSCP, FileZilla, Cyberduck, VS Code or
+  `sftp`, signed in with your LAIka username and password (or your own SSH
+  key, Settings → SFTP access). Port 2222.
+  - You see a folder per project you can open, each with `code` (main) and
+    `data` (the app's data folder). View access is read-only.
+  - `data` changes at once. `code` changes collect and become **one
+    commit by you** 30 seconds after your last change (Settings → SFTP
+    server), or when you disconnect. Until then only you see them.
+  - A file someone else changed on main meanwhile is never overwritten:
+    your version is kept in App data/.laika-sftp-conflicts and you are
+    notified ("SFTP changes could not be applied").
+  - SFTP only: no shell, commands or forwarding. It runs as the laika user
+    with a locked-down service. Failed sign-ins are limited per address
+    like the dashboard's.
+  - The installer makes the server key and opens the port in firewalld;
+    `laika doctor` checks the service and the port.
+
 ## 1.2.0
 
 - **Edit files in the browser.** Files → double-click a text file (or

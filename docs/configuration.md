@@ -92,9 +92,13 @@ Which AI does what, how much it may spend and how hard LAIka tries.
 | Repair time limit (seconds) | `600` | 120–14400 | after **Apply now** |  |
 | Review time limit (seconds) | `240` | 60–7200 | after **Apply now** |  |
 | Planning time limit (seconds) | `180` | 60–3600 | after **Apply now** |  |
+| Planning time limit for problems (seconds) | `420` | 120–3600 | after **Apply now** | Goals that report a bug or error are diagnosed first: the planner reads the code and recent failures. |
+| Most files per job | `6` | 2–30 | after **Apply now** | Bigger jobs are sent back to the planner once to be split (tests do not count). |
 | Goals planned at the same time | `4` | 1–20 | after **Apply now** |  |
-| Goal assistant model | `claude-haiku-4-5-20251001` |  | after **Apply now** | The quick model behind 'Plan it with me'. |
+| Goal assistant model | `claude-haiku-4-5-20251001` |  | after **Apply now** | The quick model behind the goal box's Questionnaire. |
 | Goal assistant cap per turn ($) | `0.3` | 0.05–5 | after **Apply now** |  |
+| Goal box Conversation model | `sonnet` |  | after **Apply now** | The model you discuss ideas with in the goal box (a Claude model name or alias). |
+| Goal box Conversation cap per reply ($) | `0.5` | 0.05–5 | after **Apply now** |  |
 
 ### Workers
 
@@ -131,6 +135,16 @@ Starting values for new projects, apps, previews and builds.
 | Build CPU limit (cores) | `2` | 1–64 | after **Apply now** |  |
 | Build time limit (seconds) | `2700` | 300–21600 | after **Apply now** |  |
 | Deleted projects can be restored for (hours) | `24` | 1–720 | after **Apply now** |  |
+
+### SFTP server
+
+Edit project files with an SFTP app (WinSCP, FileZilla, VS Code), signed in as yourself.
+
+| Setting | Default | Allowed | Applies | Notes |
+| --- | --- | --- | --- | --- |
+| SFTP access | on |  | after **Apply now** | Lets people sign in with an SFTP app using their LAIka username and password (or an SSH key). |
+| SFTP port | `2222` | 1024–65535 | after **Apply now** | On Fedora / RHEL, run `sudo laika repair` after changing it so the firewall lets it in. |
+| Commit code changes after (seconds) | `30` | 10–300 | after **Apply now** | Code changes over SFTP become one commit on main this long after the last change (or when you disconnect). |
 
 ### Backups & upkeep
 

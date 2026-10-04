@@ -28,7 +28,7 @@ REPO_ROOT = os.getenv("REPO_ROOT", "/opt/laika")
 EXPECTED_WORKERS = int(os.getenv("WATCHDOG_WORKERS", "6"))
 BACKUP_MAX_AGE_HOURS = float(os.getenv("WATCHDOG_BACKUP_MAX_AGE_HOURS", "36"))
 DISK_MIN_FREE_PERCENT = float(os.getenv("WATCHDOG_DISK_MIN_FREE_PERCENT", "10"))
-SERVICES = ["laika-orchestrator", "laika-operator", "laika-scaler"]
+SERVICES = ["laika-orchestrator", "laika-operator", "laika-scaler", "laika-sftp"]
 UNITS = SERVICES + [f"laika-worker@{n:02d}" for n in range(1, EXPECTED_WORKERS + 1)]
 
 
@@ -101,7 +101,12 @@ def check_endpoint(name, url, getter=http_json):
     return check(name, "ok", "responding")
 
 
-def check_live_tree(runner=subprocess.run):
+def check_live_tree(runner=subprocess.run, root=None):
+    # Only a git checkout of LAIka (a development server, or one that builds
+    # LAIka itself) must stay clean; a release install has no .git at all.
+    root = root or REPO_ROOT
+    if not os.path.exists(os.path.join(root, ".git")):
+        return check("live_tree", "ok", "release install (not a git checkout)")
     result = runner(["git", "-C", REPO_ROOT, "status", "--porcelain", "--untracked-files=all"],
                     text=True, capture_output=True)
     if result.returncode != 0:
@@ -342,6 +347,8 @@ def system_info(runner=subprocess.run):
     """What the dashboard shows on LAIka's own project page (the API container
     has no git): its GitHub remote, branch and current commit."""
     def git(*args):
+        if not os.path.exists(os.path.join(REPO_ROOT, ".git")):
+            return ""  # a release install: no git checkout to describe
         result = runner(["git", "-C", REPO_ROOT, *args], text=True, capture_output=True)
         return result.stdout.strip() if result.returncode == 0 else ""
     remote = git("remote", "get-url", "origin")

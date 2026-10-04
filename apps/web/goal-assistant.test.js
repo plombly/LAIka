@@ -12,7 +12,7 @@ test('idle box: typed text survives redraws; both ways to send', () => {
   assert.match(html, /What should LAIka do in &lt;G&gt;\?/);
   assert.match(html, />add &lt;a&gt; pause menu<\/textarea>/);
   assert.match(html, /data-assist-plain="project:g">Send as written/);
-  assert.match(html, /data-assist-start="project:g">Plan it with me/);
+  assert.match(html, /data-assist-start="project:g"[^>]*>Questionnaire/);
   assert.doesNotMatch(html, /—/);
   assert.equal(projectOf('project:g'), 'g');
 });
@@ -53,4 +53,25 @@ test('a failed session offers retry and sending the idea as written', () => {
   assert.match(html, /Claude is &lt;paused&gt;/);
   assert.match(html, /data-assist-retry="home"/);
   assert.match(html, /data-assist-plain="home">Send my idea as written/);
+});
+
+test('conversation: idle offers it; the conversation shows as chat with Send and Write the goal', async () => {
+  const { assistantInner, boxState, chatText, applySession } = await import('./lib/goal-assistant.js');
+  assert.match(assistantInner('project:zz'), /data-assist-chat="project:zz"[^>]*>Conversation/);
+  const state = boxState('project:chat');
+  applySession(state, { id: 'a'.repeat(16), mode: 'chat', status: 'reply', turns: [{ from: 'you', message: 'Ideas?' }, { from: 'assistant', message: 'Try **this**:\n- a `pause` menu\n- scores' }] });
+  const html = assistantInner('project:chat', state);
+  assert.match(html, /chat-bubble from-you/);
+  assert.match(html, /<b>this<\/b>/);
+  assert.match(html, /<li>a <code>pause<\/code> menu<\/li>/);
+  assert.match(html, /data-assist-send=/);
+  assert.match(html, /data-assist-write-goal=/);
+  applySession(state, { ...state.session, status: 'thinking', want: 'brief' });
+  assert.match(assistantInner('project:chat', state), /Writing the goal from your conversation/);
+  applySession(state, { ...state.session, status: 'brief', brief: { title: 'Pause', goal: 'Add pause.' } });
+  const brief = assistantInner('project:chat', state);
+  assert.match(brief, /Start this goal/);
+  assert.match(brief, /data-assist-to-chat=/);
+  assert.equal(chatText('<script>x</script>'), '<p>&lt;script&gt;x&lt;/script&gt;</p>');
+  assert.match(chatText('```js\nlet a = 1;\n```'), /<pre class="chat-code">let a = 1;\n<\/pre>/);
 });

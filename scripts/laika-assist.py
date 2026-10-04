@@ -29,6 +29,9 @@ import laika_redis  # noqa: E402
 
 MODEL = os.getenv("ASSIST_MODEL", "claude-haiku-4-5-20251001")
 BUDGET_USD = float(os.getenv("ASSIST_BUDGET_USD", "0.30"))
+CHAT_MODEL = os.getenv("ASSIST_CHAT_MODEL", "sonnet")
+CHAT_BUDGET_USD = float(os.getenv("ASSIST_CHAT_BUDGET_USD", "0.50"))
+CHAT_TIMEOUT = int(os.getenv("ASSIST_CHAT_TIMEOUT_SECONDS", "240"))
 TIMEOUT = int(os.getenv("ASSIST_TIMEOUT_SECONDS", "150"))
 MAX_RUNNING = int(os.getenv("ASSIST_MAX_CONCURRENT", "2"))
 LOG_ROOT = Path(os.getenv("ASSIST_LOG_ROOT", "/var/log/laika/assist"))
@@ -96,6 +99,67 @@ def ask(r, session, project, force_brief=False, runner=agent_cli.run_claude):
                   wrap=lambda argv: project_sandbox.command(argv, project, project.repo, kind="agent", writable=False))
 
 
+def situation(r, project, limit=5, days=7):
+    """The project's live state for a conversation: its app (state, port,
+    command, error, last log lines) and recently failed or stuck jobs."""
+    lines = []
+    app = r.hgetall(f"laika:app-status:{project.id}") or {}
+    own = (r.hget(f"laika:projects:{project.id}", "run_command") or "").strip()
+    detected = r.hget(f"laika:projects:{project.id}", "detected_run_command") or ""
+    command = own if own and own.lower() != "off" else detected
+    if not command:
+        lines.append("- App: not set up to run (no run command set or detected).")
+    else:
+        lines.append(f"- App: {app.get('state') or 'not started yet'}"
+                     + (f" on port {app['port']} (open http://<this server's address>:{app['port']}/)" if app.get("port") else "")
+                     + f"; command `{command}`" + (" (detected)" if not own else "")
+                     + (f"; error: {app['error'][:300]}" if app.get("error") else ""))
+        if app.get("log"):
+            lines.append("- App log, last lines:\n" + "\n".join("    " + line for line in app["log"].splitlines()[-12:]))
+    cutoff = time.time() - days * 86400
+    failed = []
+    for key in r.scan_iter("laika:jobs:*"):
+        if key.count(":") != 2:
+            continue
+        try:
+            job = r.hgetall(key)
+        except Exception:  # not a job record
+            continue
+        if (job.get("project_id") or "laika") != project.id or job.get("status") not in ("failed", "test_failed", "integration_failed", "needs_human"):
+            continue
+        try:
+            when = float(job.get("updated_at") or job.get("created_at") or 0)
+        except ValueError:
+            when = 0
+        if when >= cutoff:
+            failed.append((when, job))
+    for _, job in sorted(failed, key=lambda item: -item[0])[:limit]:
+        why = (job.get("error") or job.get("needs_human_reason") or "").strip()
+        lines.append(f"- Job \"{(job.get('title') or job.get('id', ''))[:80]}\" {job.get('status')}"
+                     + (f": {why.splitlines()[0][:240]}" if why else ""))
+    return "\n".join(lines)
+
+
+def chat(r, session, project, runner=agent_cli.run_claude):
+    """One reply in a goal-box Conversation."""
+    try:
+        note = group_note(r, project)
+    except Exception as exc:
+        print(f"[assist] group context: {exc}", flush=True)
+        note = ""
+    try:
+        now = situation(r, project)
+    except Exception as exc:  # context, never a reason to fail
+        print(f"[assist] situation: {exc}", flush=True)
+        now = ""
+    prompt = goal_assist.build_chat_prompt(project.name, project.id, kind_of(r, project.id), session["turns"],
+                                           recent_goals(r, project.id), group_note=note, situation=now)
+    log_path = LOG_ROOT / f"{session['id']}-{len(session['turns'])}-chat.json"
+    return runner("assistant", prompt, project.repo, log_path, CHAT_TIMEOUT, model=CHAT_MODEL, budget_usd=CHAT_BUDGET_USD,
+                  tools=agent_cli.READ_ONLY_TOOLS, system_prompt=goal_assist.CHAT_SYSTEM_PROMPT,
+                  wrap=lambda argv: project_sandbox.command(argv, project, project.repo, kind="agent", writable=False))
+
+
 def fail(r, session_id, message):
     goal_assist.save(r, session_id, status="failed", error=message[:500])
     return 1
@@ -123,7 +187,28 @@ def main(session_id, r=None, runner=agent_cli.run_claude, wait=time.sleep):
     goal_assist.save(r, session_id, status="thinking", error="")
     try:
         cost = float(session.get("cost_usd") or 0)
-        for force_brief in (False, True):
+        chatting = session.get("mode") == "chat"
+        if chatting and session.get("want") != "brief":
+            run = chat(r, session, project, runner=runner)
+            if run.result:
+                cost += float(run.result.get("total_cost_usd") or 0)
+            if not run.ok:
+                goal_assist.save(r, session_id, cost_usd=cost)
+                if run.unavailable:
+                    agent_cli.start_cooldown(r, f"claude unavailable: {run.describe_error()}")
+                    return fail(r, session_id, "Claude is not available right now (usage limit or login). Try again later.")
+                return fail(r, session_id, f"The assistant failed: {run.describe_error()[:300]}")
+            try:
+                text = goal_assist.parse_chat_reply(run.text)
+            except ValueError as exc:
+                goal_assist.save(r, session_id, cost_usd=cost)
+                return fail(r, session_id, str(exc))
+            if r.hget(goal_assist.session_key(session_id), "status") != "thinking":
+                return 0
+            goal_assist.save(r, session_id, status="reply", turns=session["turns"] + [{"from": "assistant", "message": text}],
+                             cost_usd=cost, model=CHAT_MODEL)
+            return 0
+        for force_brief in ((True,) if chatting else (False, True)):
             run = ask(r, session, project, force_brief=force_brief, runner=runner)
             if run.result:
                 cost += float(run.result.get("total_cost_usd") or 0)

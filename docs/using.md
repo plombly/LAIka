@@ -19,12 +19,22 @@ first when workers are busy.
 Type what you want into a goal box, as you would tell a developer:
 
 - **Send as written** plans it straight away.
-- **Plan it with me** first asks up to three questions and writes a precise
+- **Questionnaire** first asks up to three quick questions and writes a precise
   brief for you to check, change or send.
+- **Conversation** is an open conversation with Claude about the
+  project: discuss changes, ask what could be better, get ideas you had not
+  thought of. Claude reads the code to answer concretely. When you are
+  ready, **Write the goal** turns the conversation into a brief; you can
+  still edit it, keep talking, or start it. Nothing is built before that.
 
 LAIka plans the goal into jobs (one-step goals skip planning). Jobs that
 touch different files run in parallel; jobs that depend on each other
 wait. You can follow every job live: its log, tests, review and time.
+
+Describing a problem ("the lobby crashes when a second player joins")
+makes the planner diagnose first: it reads the code and the project's
+recent failures before deciding what to change, and asks for a test that
+proves the fix.
 
 Good goals say *what* and *why*, name anything that must not change, and
 say how you will check it. Templates on a project's Overview help.
@@ -32,7 +42,7 @@ say how you will check it. Templates on a project's Overview help.
 ## Approving
 
 When a change has passed its tests and the independent review, it appears
-under **Needs you** on the home page:
+under **Needs you** on the home page and at the top of its project's page:
 
 - **Approve** merges that exact change into the project's main branch.
 - **Preview** (web apps) runs the change on its own port so you can try it
@@ -55,7 +65,7 @@ always for this project, or keep tests offline.
 
 ## Apps and previews
 
-Give a project a **run command** (or let LAIka detect it) and its app runs
+Give a project a **run command**, or leave it empty and LAIka runs what the code implies (`npm start`, a Procfile, a Python server reading `PORT`; type `off` to never run it), and its app runs
 on this server from the latest main, on a port in 8100–8199, restarted if
 it crashes. Its data lives in `/var/lib/laika/project-data/<project>`
 (the **App data** tab under Files). Secrets for the app go in the project's
@@ -78,6 +88,24 @@ image and output in Settings. The newest builds are kept.
   keep your text.
 - **History** lists every change on main; **Undo** reverts one (as a new
   commit, so history is never lost).
+
+## SFTP
+
+Prefer your own editor? **Settings → SFTP access** shows the address (port
+2222), your username and the server's key. Connect any SFTP app (WinSCP,
+FileZilla, Cyberduck, VS Code with an SFTP extension, `sftp`) with your
+LAIka username and password, or add your SSH public key there.
+
+- Each project you can open is a folder with **code** (main) and **data**
+  (the app's data folder). With View access everything is read-only.
+- **data** changes at once.
+- **code** changes are collected and committed to main as **one commit by
+  you** 30 seconds after your last change (or when you disconnect).
+  Until then only you see them. Every batch is one entry in History, so
+  **Undo** takes back a whole editing session.
+- If someone changed a file on main while you were editing it, your version
+  is not forced over theirs: it is kept in App data under
+  `.laika-sftp-conflicts/` and you get a notification.
 
 ## Groups
 

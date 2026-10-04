@@ -440,8 +440,15 @@ def process_merge_queue():
     of its queue stale). Returns the merged job ids."""
     merged = []
     for project in laika_projects.all_projects(r):
-        with project_context(project.id):
-            job_id = _process_project_queue(project)
+        # One project's trouble (e.g. LAIka's own folder is not a git checkout
+        # on a release install) must never stop the other projects' queues.
+        try:
+            with project_context(project.id):
+                job_id = _process_project_queue(project)
+        except (SystemExit, Exception) as exc:
+            if r.lrange(project.merge_queue_key, 0, 0):
+                print(f"merge queue of {project.id}: {getattr(exc, 'message', exc)}", file=sys.stderr)
+            continue
         if job_id:
             merged.append(job_id)
     return merged
@@ -450,8 +457,15 @@ def process_merge_queue():
 def _process_project_queue(project):
     queue = project.merge_queue_key
     ids = r.lrange(queue, 0, -1)
-    main_head = git("rev-parse", "HEAD").stdout.strip()
-    r.set(project.main_head_key, main_head)
+    try:
+        main_head = git("rev-parse", "HEAD").stdout.strip()
+    except (SystemExit, Exception):
+        if not ids:
+            return None  # no git here (a release install's own folder) and nothing queued
+        raise
+    r.set(project.main_head_key, main_head)  # also shown as the dashboard's repository head
+    if not ids:
+        return None
     for job_id in ids:
         key = f"laika:jobs:{job_id}"
         data = r.hgetall(key)
