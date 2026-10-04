@@ -72,6 +72,10 @@ image and output in Settings. The newest builds are kept.
 
 - **Files** browses the code on main and the app's data; upload, move,
   rename and delete (changes to code become one commit on main).
+  Double-click a text file to edit it (or right-click → **Edit**, or **New
+  file**): app data saves at once, code saves as a commit on main. If the
+  file changed since you opened it, LAIka refuses to overwrite it and you
+  keep your text.
 - **History** lists every change on main; **Undo** reverts one (as a new
   commit, so history is never lost).
 
@@ -110,6 +114,18 @@ LAIka access. Put real secrets behind the app's own sign-in.
 
 ## Notifications and the digest
 
-**Settings → Notifications**: a Discord webhook and/or an ntfy topic, what
-to send for each event (ping, post or nothing), quiet hours, and a weekly
-digest of what got done.
+**Settings → My notifications** (everyone): your own Discord webhook and/or
+ntfy topic, what to send for each event (ping, post or nothing), quiet
+hours, and a weekly digest of your projects. You only hear about projects
+you can see:
+
+| Event | Who gets it |
+| --- | --- |
+| A change is ready for approval | people with **Approve** on that project |
+| A job is stuck, an app crashed | **Build** and up |
+| A goal finished or failed | whoever gave it (choose "every goal in my projects" for all of them) |
+| A backup failed, health turned red | administrators |
+
+**Settings → Server notifications** (administrators): the server's own
+channel, for example a team Discord channel. It gets every event, and the
+dashboard address used in all messages is set here.

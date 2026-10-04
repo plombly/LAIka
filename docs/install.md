@@ -11,14 +11,33 @@ You need:
 
 | | Minimum | Recommended |
 | --- | --- | --- |
-| System | Ubuntu 22.04 / 24.04 / 26.04, Debian 12 / 13 | Ubuntu 24.04 LTS |
+| System | Ubuntu 22.04 / 24.04 / 26.04, Debian 12 / 13, Fedora 41+, RHEL / AlmaLinux / Rocky Linux 9 and 10 | Ubuntu 24.04 LTS |
 | CPU | 2 cores, x86_64 or arm64 | 4+ cores |
 | Memory | 4 GB | 8 GB or more |
 | Disk | 20 GB free | 40 GB+ (projects, builds, backups) |
 | Network | outbound internet | a VPN for remote access |
 
-Fedora 40+ and RHEL 9 compatibles (Rocky, Alma) install too but are
-experimental. Other systems are refused unless you set `LAIKA_FORCE_OS=1`.
+Other systems are refused unless you set `LAIKA_FORCE_OS=1`.
+
+**Fedora and RHEL family:**
+- **Python:** RHEL 9's Python is 3.9, so the installer adds the system's own
+  Python 3.11 package for LAIka.
+- **Firewall:** if firewalld is running, the installer opens **8080** (the
+  dashboard) and **8100–8299** (project apps and previews) in the zones of the server's
+  network (not Docker's), and says so. `laika uninstall` closes them again, and `laika doctor`
+  checks them.
+- **RHEL 10 family** needs a CPU with x86-64-v3 (most from 2015 on), as
+  do Docker's packages for it. Many virtual machines show a generic CPU
+  without it: set the VM's CPU type to "host", or use version 9. The
+  installer checks this first.
+- **Tested** on Fedora 42, AlmaLinux 9 and Rocky Linux 9 (full clean-install
+  test). Version 10 is accepted but not yet tested.
+- **SELinux** may stay enforcing: LAIka's containers use Docker's own
+  labels. Its use with SELinux enforcing on a physical machine has not yet
+  been verified; the clean-install tests run in containers.
+- **ufw users** (Ubuntu, Debian) open those ports themselves:
+  `sudo ufw allow from 192.168.0.0/16 to any port 8080`, and the same for
+  8100:8299/tcp.
 
 You also need at least one AI provider: a **Claude** Pro or Max subscription
 (or an Anthropic API key) and/or a **ChatGPT** plan with Codex (or an OpenAI

@@ -2,6 +2,33 @@
 
 All notable changes to LAIka. Versions follow [semantic versioning](https://semver.org).
 
+## 1.2.0
+
+- **Edit files in the browser.** Files → double-click a text file (or
+  right-click → Edit, or New file). App data saves at once; code saves as
+  one commit on main. A file that changed since you opened it is never
+  overwritten: you are told, and keep your text. Tab indents, Enter keeps
+  the indentation, Ctrl+S saves, optional line wrap. Files up to 2 MB; View
+  access opens them read-only.
+
+- **Fedora and RHEL.** Fedora 41+ and RHEL / AlmaLinux / Rocky Linux 9 and
+  10 are supported. Fedora 42, AlmaLinux 9 and Rocky Linux 9 pass the same
+  clean-machine test as Ubuntu and Debian; version 10 needs an x86-64-v3
+  CPU (checked before installing) and is not yet tested.
+  - RHEL 9 gets Python 3.11 from its own packages.
+  - Docker's packages and the nftables-based iptables are installed.
+  - If firewalld is running, the installer opens 8080 and 8100–8299 (and
+    the uninstaller closes them); `laika doctor` checks the ports.
+- **Notifications for everyone.** Settings → My notifications: each person
+  sets their own Discord webhook or ntfy topic, which events they want,
+  quiet hours and a weekly digest.
+  - They only hear about projects they can see, at the level each event
+    needs: approvals for Approve, stuck jobs and app problems for Build,
+    their own goals (or every goal), and backups and health for
+    administrators.
+  - The server's channel stays, as Settings → Server notifications.
+  - Removing a person removes their notification settings.
+
 ## 1.1.1
 
 - Settings → AI explains that Claude's and OpenAI's sign-in pages ask you to
