@@ -49,6 +49,9 @@ class ProjectPatch(BaseModel):
     # tests "" = offline, ask when they need it / "always"; builds "" or
     # "internet" = internet but not this server or the LAN / "none".
     gate_network: Optional[Literal["", "always"]] = None
+    # Monthly spending limit in dollars (0 = none) and what happens at it (apps/api/spending.py).
+    budget_usd: Optional[float] = Field(default=None, ge=0, le=1000000)
+    budget_mode: Optional[Literal["block", "warn"]] = None
     build_network: Optional[Literal["", "internet", "none"]] = None
 
 
@@ -395,6 +398,9 @@ def get_project(project_id: str, limit: int = Query(25, ge=1, le=100)):
         raise HTTPException(status_code=404, detail="Project not found")
     main = _redis()
     item = _item(project_id)
+    item["spending"] = project_spending(project_id)
+    import access
+    item["my_spending"] = person_spending(access.current_name())
     goals = [(key, data) for key, data in _scan_hashes(main, "laika:goals:*", _GOAL_KEY)
              if _text(data.get("project_id"), "laika") == project_id]
     jobs = [(key, data) for key, data in _scan_hashes(main, "laika:jobs:*", _JOB_KEY)
@@ -408,6 +414,41 @@ def get_project(project_id: str, limit: int = Query(25, ge=1, le=100)):
     return item
 
 
+_SPEND_CACHE = {"at": 0.0, "totals": ({}, {})}
+
+
+def spend_totals(max_age=10):
+    """({project: $}, {person: $}) this month from job and goal records."""
+    import spending
+    if time.time() - _SPEND_CACHE["at"] > max_age:
+        main = _redis()
+        jobs = {match: data for match, data in ((k.split(":")[2], d) for k, d in _scan_hashes(main, "laika:jobs:*", _JOB_KEY))}
+        goals = {match: data for match, data in ((k.split(":")[2], d) for k, d in _scan_hashes(main, "laika:goals:*", _GOAL_KEY))}
+        _SPEND_CACHE.update(at=time.time(), totals=spending.totals(jobs, goals, spending.month_start()))
+    return _SPEND_CACHE["totals"]
+
+
+def project_spending(project_id):
+    import spending
+    return spending.project_state(_redis().redis, project_id, _project_data(project_id), spend_totals()[0])
+
+
+def person_spending(name):
+    import access
+    import spending
+    user = access.get_user(_redis().redis, name) if name else None
+    return spending.person_state(_redis().redis, user["name"], user, spend_totals()[1]) if user else None
+
+
+def check_spending(project_id, request):
+    """Refuse new work when this project's or this person's monthly limit is used up (mode block)."""
+    import spending
+    ctx = getattr(getattr(request, "state", None), "ctx", None)
+    message = spending.blocked(project_spending(project_id), person_spending(getattr(ctx, "name", "")))
+    if message:
+        raise HTTPException(status_code=409, detail=message)
+
+
 @router.post("/api/projects/{project_id}/goals", status_code=202)
 def submit_project_goal(project_id: str, payload: ProjectGoal, request: Request = None):
     project_id = _id(project_id)
@@ -416,6 +457,7 @@ def submit_project_goal(project_id: str, payload: ProjectGoal, request: Request 
     status = _project_data(project_id).get("status", "active")
     if status in {"archived", "pending_key"}:
         raise HTTPException(status_code=409, detail="Project is not accepting goals")
+    check_spending(project_id, request)
     main = _redis()
     result = main._submit_goal(payload, project_id=project_id)
     result["project_id"] = project_id
@@ -435,6 +477,15 @@ def patch_project(project_id: str, payload: ProjectPatch):
     if project_id == "laika" and not main.redis.hgetall(key):
         main.redis.hset(key, mapping={"id": "laika", "name": "LAIka", "status": "active"})
     changes = payload.model_dump(exclude_none=True)
+    if {"budget_usd", "budget_mode"} & set(changes):
+        import access
+        import spending
+        rule = spending.policy(main.redis)
+        ctx = access.CURRENT.get()
+        if rule == "off":
+            raise HTTPException(status_code=409, detail="Spending limits are turned off (Settings -> AI & pipeline)")
+        if rule == "admins" and ctx is not None and not ctx.is_admin:
+            raise HTTPException(status_code=403, detail="Only administrators set spending limits on this server")
     if project_id == "laika":
         # LAIka's commands are its own gate and control plane: never editable.
         changes = {k: v for k, v in changes.items() if k in ("importance", "type", "type_description")}

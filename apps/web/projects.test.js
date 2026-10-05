@@ -240,3 +240,33 @@ test('play-test results: passed, broken with reasons, skipped for non-pages', as
   assert.match(bad, /testing the new one/);
   assert.equal(playtestMarkup('api', { skipped: 'not a page', ok: true }), '');
 });
+
+test('spending: a bar, a notice from 80% and the settings form', async () => {
+  const { spendingBar, spendingNotice, spendingSettingsMarkup } = await import('./lib/projects.js');
+  assert.match(spendingBar({ spent: 4, budget: 10, percent: 40, state: 'ok' }), /\$4\.00 of \$10\.00 this month \(40%\)/);
+  assert.match(spendingBar({ spent: 4, budget: 0, percent: 0, state: 'none' }), /no limit/);
+  assert.equal(spendingNotice({ spent: 4, budget: 10, percent: 40, state: 'ok' }), '');
+  assert.match(spendingNotice({ spent: 9, budget: 10, percent: 90, state: 'warn', mode: 'block' }), /90% of this project's monthly spending limit/);
+  assert.equal(spendingNotice({ spent: 11, budget: 10, percent: 110, state: 'over', mode: 'block' }), '');  // the goal box says it
+  assert.match(spendingNotice({ spent: 11, budget: 10, percent: 110, state: 'over', mode: 'warn' }), /warn only/);
+  assert.match(spendingSettingsMarkup({ spending: { spent: 1, budget: 10, percent: 10, state: 'ok', mode: 'warn' } }), /<option value="warn" selected>Only warn/);
+});
+
+test('spending: people who cannot approve see the limit, not a form', async () => {
+  const { spendingSettingsMarkup } = await import('./lib/projects.js');
+  const html = spendingSettingsMarkup({ my_access: 'build', spending: { spent: 1, budget: 10, percent: 10, state: 'ok', mode: 'block' } });
+  assert.doesNotMatch(html, /<form/);
+  assert.match(html, /People who may approve this project set the limit/);
+});
+
+test('spending: the goal box is paused with the reason, and the setting decides who edits', async () => {
+  const { goalsBlockedReason, spendingSettingsMarkup } = await import('./lib/projects.js');
+  const over = { spent: 12, budget: 10, percent: 120, state: 'over', mode: 'block', policy: 'approvers' };
+  assert.match(goalsBlockedReason({ spending: over }), /This project's monthly spending limit is used up \(\$12\.00 of \$10\.00\)/);
+  assert.match(goalsBlockedReason({ spending: { ...over, policy: 'admins' } }), /an administrator raises/);
+  assert.match(goalsBlockedReason({ spending: { state: 'ok' }, my_spending: over }), /^Your monthly spending limit/);
+  assert.equal(goalsBlockedReason({ spending: { ...over, mode: 'warn' } }), '');
+  assert.equal(spendingSettingsMarkup({ my_access: 'admin', spending: { ...over, policy: 'off' } }), '');
+  assert.doesNotMatch(spendingSettingsMarkup({ my_access: 'approve', spending: { ...over, policy: 'admins' } }), /<form/);
+  assert.match(spendingSettingsMarkup({ my_access: 'approve', spending: { ...over, policy: 'approvers' } }), /<form/);
+});
