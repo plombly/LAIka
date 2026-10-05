@@ -475,3 +475,49 @@ def test_a_project_can_be_renamed_but_not_to_markup_or_blank(monkeypatch):
     assert client.patch("/api/projects/web", json={"name": "Tank Tumble"}).json()["name"] == "Tank Tumble"
     for bad in ("", "   ", "a\nb", "<script>"):
         assert client.patch("/api/projects/web", json={"name": bad}).status_code == 422, bad
+
+
+def test_the_apps_live_log_is_served_from_what_the_apps_service_published(monkeypatch):
+    import json as _json
+    from fastapi.testclient import TestClient
+    import main
+    fake = FakeRedis({"laika:projects:web": {"id": "web", "name": "web", "status": "active"}}, members=["web"])
+    monkeypatch.setattr(main, "redis", fake)
+    client = TestClient(main.app)
+    assert client.get("/api/projects/web/app/log").json()["lines"] == []
+    fake.strings["laika:app-log:web"] = _json.dumps({"lines": ["2026-10-04T09:30:00 listening on 8100"], "restarts": 1, "result": "success", "since": "x", "at": 1})
+    body = client.get("/api/projects/web/app/log").json()
+    assert body["lines"] == ["2026-10-04T09:30:00 listening on 8100"] and body["restarts"] == 1
+    assert client.get("/api/projects/nope/app/log").status_code == 404
+
+
+def test_templates_are_listed_and_checked(monkeypatch):
+    from fastapi.testclient import TestClient
+    import main
+    monkeypatch.setattr(main, "redis", FakeRedis({}, members=[]))
+    client = TestClient(main.app)
+    ids = {t["id"] for t in client.get("/api/project-templates").json()["templates"]}
+    assert {"web-game", "website", "api-website", "python-service", "cli-tool", "discord-bot"} <= ids
+    bad = client.post("/api/projects", json={"id": "g", "name": "G", "source": "empty", "template": "nope", "request_id": "req-12345678"})
+    assert bad.status_code == 422
+
+
+def test_remote_access_reads_status_and_queues_host_actions(monkeypatch):
+    import json as _json
+    from fastapi.testclient import TestClient
+    import main
+    import project_routes
+    fake = FakeRedis({}, members=[])
+    fake.delete = lambda *keys: [fake.strings.pop(k, None) for k in keys]
+    fake.strings["laika:remote:status"] = _json.dumps({"installed": True, "state": "connected", "ips": ["100.64.0.5"],
+                                                       "checked_at": __import__("time").time()})
+    monkeypatch.setattr(main, "redis", fake)
+    queued = []
+    monkeypatch.setattr(project_routes, "_operator_request", lambda action, rid, fields: queued.append(action) or {"status": "pending"})
+    client = TestClient(main.app)
+    body = client.get("/api/remote").json()
+    assert body["status"]["state"] == "connected" and body["stale"] is False
+    for action in ("install", "login", "logout", "refresh"):
+        assert client.post(f"/api/remote/{action}", json={"request_id": "req-12345678"}).status_code == 202
+    assert queued == ["remote_install", "remote_login", "remote_logout", "remote_status"]
+    assert client.post("/api/remote/funnel", json={"request_id": "req-12345678"}).status_code == 404

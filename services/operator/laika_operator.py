@@ -65,7 +65,8 @@ OUTPUT_LIMIT = 8000
 # network_*: answer a job's internet-access request (job-review.py network).
 NETWORK_ACTIONS = ("network_once", "network_always", "network_deny")
 # Host helpers (scripts/laika-system.py, laika-providers.py), run as their own unit.
-SYSTEM_ACTIONS = ("apply_settings", "provider_login", "provider_status", "provider_apply_keys", "system_update")
+SYSTEM_ACTIONS = ("apply_settings", "provider_login", "provider_status", "provider_apply_keys", "system_update",
+                  "remote_status", "remote_install", "remote_login", "remote_logout")
 ACTIONS = ("approve", "queue_approve", "dequeue_approve", "reject", "extend", "reintegrate", "reopen", *NETWORK_ACTIONS,
            "create_project", "project_retry_clone", "project_push_setup", "delete_project",
            "project_commit_upload", "restore_project", "project_revert", *SYSTEM_ACTIONS)
@@ -83,7 +84,7 @@ REQUEST_FIELDS = (
     "request_id", "job_id", "action", "expected_status",
     "expected_candidate", "extra", "requested_from",
     "project_id", "name", "importance", "source", "url", "gate", "confirm", "path", "upload", "op", "dest",
-    "batch", "on_conflict", "trash_id", "undo_job", "undo_commit", "expected_sha256", "author",
+    "batch", "on_conflict", "trash_id", "undo_job", "undo_commit", "expected_sha256", "author", "template",
 )
 # project_commit_upload commits one dashboard file change to a project's main:
 # an upload (op "upload", the default) or a file-browser operation.
@@ -247,6 +248,10 @@ def validate_project_request(action, fields):
         gate = fields.get("gate", "")
         if len(gate) > 200 or "\n" in gate or "\r" in gate:
             raise Invalid("gate command must be one line of at most 200 characters")
+        template = fields.get("template", "")
+        if template and (source != "empty" or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", template)):
+            raise Invalid("a template needs an empty project and a template id")
+        request["template"] = template
         request.update(name=name, importance=importance, source=source, url=url,
                        push_remote=push_remote, gate=gate)
     elif action == "delete_project":
@@ -320,6 +325,8 @@ def project_cli_args(request):
         args += ["--empty"] if request["source"] == "empty" else ["--clone", request["url"]]
         if request.get("gate"):
             args += ["--gate", request["gate"]]
+        if request.get("template"):
+            args += [f"--template={request['template']}"]
         if request.get("push_remote"):
             args += ["--push-remote", request["push_remote"]]
         return args
@@ -381,7 +388,7 @@ def validate(fields, entry_id, now):
             raise Invalid(f"what must be one of {', '.join(APPLY_WHAT)}")
         if action == "provider_login" and what not in ("claude", "codex"):
             raise Invalid("provider must be claude or codex")
-        if action in ("provider_status", "provider_apply_keys", "system_update"):
+        if action in ("provider_status", "provider_apply_keys", "system_update") or action.startswith("remote_"):
             what = ""
         return {"action": action, "what": what, "job_id": "", "project_id": ""}
     if action in PROJECT_ACTIONS:
@@ -464,7 +471,14 @@ SYSTEM_COMMANDS = {
     "provider_status": ("providers", "scripts/laika-providers.py", lambda what: ["status"]),
     "provider_apply_keys": ("keys", "scripts/laika-providers.py", lambda what: ["apply-keys"]),
     "system_update": ("update", "scripts/laika-update.py", lambda what: ["apply", "--yes"]),
+    # Remote access (scripts/laika-remote.py): Tailscale is the host's, so root.
+    "remote_status": ("remote", "scripts/laika-remote.py", lambda what: ["status"]),
+    "remote_install": ("remote", "scripts/laika-remote.py", lambda what: ["install"]),
+    "remote_login": ("remote", "scripts/laika-remote.py", lambda what: ["login"]),
+    "remote_logout": ("remote", "scripts/laika-remote.py", lambda what: ["logout"]),
 }
+ROOT_SYSTEM_ACTIONS = ("apply_settings", "system_update", "remote_status", "remote_install", "remote_login",
+                       "remote_logout")
 
 
 def execute_system(request, runner=subprocess.run):
@@ -474,7 +488,7 @@ def execute_system(request, runner=subprocess.run):
     name = f"laika-{tag}-{int(time.time())}"
     # Settings and updates change the host (root); sign-ins belong to the
     # laika user, whose home holds the agent CLIs' logins.
-    as_user = [] if request["action"] in ("apply_settings", "system_update") else laika_user.systemd_run_args()
+    as_user = [] if request["action"] in ROOT_SYSTEM_ACTIONS else laika_user.systemd_run_args()
     result = runner([os.environ.get("SYSTEMD_RUN", "systemd-run"), f"--unit={name}", "--collect", "--quiet",
                      "--property=EnvironmentFile=-/etc/laika/providers/providers.env",
                      "--property=EnvironmentFile=-/etc/laika/redis.env", *as_user,

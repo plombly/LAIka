@@ -4,6 +4,9 @@
 
 A project is one git repository. Create one under **Projects → New**:
 
+- **From a template**: a working starter with tests and a run command: web
+  game, website, API + website, Python web service, command-line tool or
+  Discord bot (add its token under Settings → Secrets).
 - **Empty**: LAIka starts a fresh repository.
 - **Clone**: from GitHub or any git URL; private repositories get their own
   deploy key, which the page shows you to add to the repository.
@@ -70,6 +73,12 @@ on this server from the latest main, on a port in 8100–8199, restarted if
 it crashes. Its data lives in `/var/lib/laika/project-data/<project>`
 (the **App data** tab under Files). Secrets for the app go in the project's
 Settings → Secrets.
+
+The app box on the project page has a **Live log** (the app's own output,
+restarts and how it last exited) and, for apps that serve a web page, the
+latest **play-test**: after every deploy LAIka opens the page in a headless
+browser and reports errors, failed requests or a blank page, with a
+screenshot.
 
 ## Builds
 
@@ -157,3 +166,12 @@ you can see:
 **Settings → Server notifications** (administrators): the server's own
 channel, for example a team Discord channel. It gets every event, and the
 dashboard address used in all messages is set here.
+
+## Remote access
+
+**Settings → Remote access** (administrators) puts this server on your
+private Tailscale network: **Install Tailscale**, then **Connect to my
+Tailscale account** and approve the server with the link it shows. Install
+Tailscale on your phone or laptop with the same account, and the
+addresses listed there (dashboard, apps, SFTP) work from anywhere. Nothing
+becomes public, and **Disconnect** removes the server from your tailnet.

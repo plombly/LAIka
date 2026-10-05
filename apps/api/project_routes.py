@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+from pathlib import Path
 from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -64,7 +65,29 @@ class ProjectCreate(BaseModel):
     url: Optional[str] = Field(default=None, pattern=_GIT_URL)
     push_remote: Optional[str] = Field(default=None, pattern=_GIT_URL)
     gate: Optional[str] = Field(default=None, max_length=200, pattern=r"^[^\r\n]*$")
+    template: Optional[str] = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,39}$")
     request_id: str = Field(pattern=_REQUEST_ID)
+
+
+TEMPLATES_DIR = Path(__file__).resolve().parent / "project_templates"
+
+
+def project_templates():
+    """The starters new projects can begin from (project_templates/<id>/template.json)."""
+    found = []
+    for meta in sorted(TEMPLATES_DIR.glob("*/template.json")):
+        try:
+            data = json.loads(meta.read_text())
+        except ValueError:
+            continue
+        found.append({"id": meta.parent.name, "name": data.get("name", meta.parent.name),
+                      "description": data.get("description", ""), "type": data.get("type", "")})
+    return found
+
+
+@router.get("/api/project-templates")
+def list_project_templates():
+    return {"templates": project_templates()}
 
 
 class ProjectPushSetup(BaseModel):
@@ -189,13 +212,63 @@ def _system_info():
             "gate": "scripts/integration-check.py (tests, self-tests, diagnostics)"}
 
 
+@router.get("/api/projects/{project_id}/app/playtest.png")
+def playtest_screenshot(project_id: str):
+    """The last play-test's screenshot (scripts/laika-playtest.py)."""
+    from fastapi.responses import FileResponse
+    import file_routes
+    project_id = _id(project_id)
+    if not _known(project_id) or project_id == "laika":
+        raise HTTPException(status_code=404, detail="Project not found")
+    root = _text(_project_data(project_id).get("root"))
+    try:
+        rel = Path(root).relative_to(file_routes.HOST_PROJECTS)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="No screenshot")
+    shot = file_routes.PROJECTS_MOUNT / rel / "playtest" / "latest.png"
+    if not shot.is_file() or shot.is_symlink():
+        raise HTTPException(status_code=404, detail="No screenshot yet")
+    return FileResponse(shot, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@router.get("/api/projects/{project_id}/app/log")
+def app_log(project_id: str):
+    """The running app's recent log lines (published by the apps service)."""
+    project_id = _id(project_id)
+    if not _known(project_id) or project_id == "laika":
+        raise HTTPException(status_code=404, detail="Project not found")
+    try:
+        data = json.loads(_redis().redis.get(f"laika:app-log:{project_id}") or "null")
+    except ValueError:
+        data = None
+    if not data:
+        return {"lines": [], "restarts": 0, "result": "", "since": "", "at": None}
+    return {"lines": [str(line) for line in data.get("lines", [])][-400:], "restarts": int(data.get("restarts") or 0),
+            "result": _text(data.get("result")), "since": _text(data.get("since")), "at": data.get("at")}
+
+
 def _app_status(project_id):
     status = _data(_redis().redis.hgetall(f"laika:app-status:{project_id}"))
     if not status:
         return None
     return {"state": _text(status.get("state"), "unknown"), "port": _numeric(status.get("port")),
             "commit": _text(status.get("commit")), "error": _text(status.get("error")),
-            "log": _text(status.get("log")), "updated_at": _numeric(status.get("updated_at"))}
+            "log": _text(status.get("log")), "updated_at": _numeric(status.get("updated_at")),
+            "playtest": _playtest(project_id)}
+
+
+def _playtest(project_id):
+    try:
+        data = json.loads(_redis().redis.get(f"laika:playtest:{project_id}") or "null")
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    keep = ("ok", "skipped", "error", "commit", "at", "title", "status", "blank", "console_errors", "page_errors",
+            "failed_requests")
+    result = {k: data[k] for k in keep if k in data}
+    result["screenshot"] = bool(data.get("screenshot"))
+    return result
 
 
 # --- project groups (services/laika_projects.py: one level, the parent controls
@@ -496,10 +569,12 @@ def create_project(payload: ProjectCreate):
         raise HTTPException(status_code=409, detail="Project already exists")
     if payload.source == "clone" and not payload.url:
         raise HTTPException(status_code=422, detail="A clone needs a git URL")
+    if payload.template and (payload.source != "empty" or payload.template not in {t["id"] for t in project_templates()}):
+        raise HTTPException(status_code=422, detail="Unknown template (templates start empty projects)")
     return _operator_request("create_project", payload.request_id, {
         "project_id": payload.id, "name": payload.name, "importance": payload.importance,
         "source": payload.source, "url": payload.url if payload.source == "clone" else "",
-        "push_remote": payload.push_remote, "gate": payload.gate})
+        "push_remote": payload.push_remote, "gate": payload.gate, "template": payload.template or ""})
 
 
 @router.post("/api/projects/{project_id}/retry-clone", status_code=202)

@@ -106,6 +106,23 @@ def log_tail(project_id, lines=30):
     return out[-4000:]
 
 
+LIVE_LOG_LINES = 200
+
+
+def publish_log(project_id):
+    """The app's recent log (with times) and restart count for the project
+    page's live log: laika:app-log:<id>, refreshed every loop while it runs."""
+    lines = run([JOURNALCTL, "-u", unit_name(project_id), "-n", str(LIVE_LOG_LINES), "--no-pager",
+                 "-o", "short-iso"]).stdout.splitlines()
+    shown = run([SYSTEMCTL, "show", unit_name(project_id), "-p", "NRestarts", "-p", "Result", "-p",
+                 "ActiveEnterTimestamp"]).stdout
+    info = dict(line.split("=", 1) for line in shown.splitlines() if "=" in line)
+    redis.set(f"laika:app-log:{project_id}", json.dumps({
+        "lines": [line[-1000:] for line in lines if not line.startswith("-- ")],
+        "restarts": int(info.get("NRestarts") or 0), "result": info.get("Result", ""),
+        "since": info.get("ActiveEnterTimestamp", ""), "at": time.time()}), ex=300)
+
+
 def set_status(project_id, **fields):
     fields["updated_at"] = str(time.time())
     redis.hset(STATUS_PREFIX + project_id, mapping={k: str(v) for k, v in fields.items()})
@@ -233,9 +250,18 @@ def reconcile(project):
         deploy(project, head, port)
         return
     state = unit_state(project.id)
+    if state in ("active", "activating", "failed"):
+        try:
+            publish_log(project.id)
+        except Exception as exc:  # the log is a convenience
+            print(f"[laika-apps] log of {project.id}: {exc}", flush=True)
     if state == "active":
         if status.get("state") != "running":
             set_status(project.id, state="running", error="")
+        try:
+            maybe_playtest(project, status)
+        except Exception as exc:
+            print(f"[laika-apps] play-test of {project.id}: {exc}", flush=True)
     elif state == "failed":
         result = run([SYSTEMCTL, "show", unit_name(project.id), "-p", "Result", "--value"]).stdout.strip()
         reason = (f"it used more than its {project.run_memory_mb} MB memory limit"
@@ -470,6 +496,46 @@ def launch_builds(projects):
         if result.returncode:
             redis.hset(f"laika:build:{project.id}:{build_id}", mapping={"status": "failed",
                        "error": f"could not start the build: {(result.stderr or result.stdout).strip()[:300]}"})
+
+
+PLAYTEST_SCRIPT = Path(__file__).resolve().parents[2] / "scripts/laika-playtest.py"
+PLAYTEST_AFTER_SECONDS = 8  # let a fresh deploy start listening first
+
+
+def maybe_playtest(project, status, opener=None):
+    """Once per deployed commit: if the app serves a web page, start
+    scripts/laika-playtest.py (headless Chrome) as unit laika-playtest-<id>."""
+    if os.environ.get("PLAYTEST_ENABLED", "true").lower() in ("0", "false", "no", "off"):
+        return
+    commit, port = status.get("commit", ""), status.get("port", "")
+    try:
+        deployed = float(status.get("deployed_at") or 0)
+    except ValueError:
+        deployed = 0
+    if not commit or not port or time.time() - deployed < PLAYTEST_AFTER_SECONDS:
+        return
+    try:
+        done = json.loads(redis.get(f"laika:playtest:{project.id}") or "{}")
+    except ValueError:
+        done = {}
+    if done.get("commit") == commit or unit_is_running(f"laika-playtest-{project.id}"):
+        return
+    import urllib.request
+    try:
+        with (opener or urllib.request.urlopen)(f"http://127.0.0.1:{port}/", timeout=3) as response:
+            kind = response.headers.get("content-type", "")
+    except Exception as exc:
+        kind = getattr(getattr(exc, "headers", None), "get", lambda *a: "")("content-type", "")
+    if "html" not in kind.lower():
+        redis.set(f"laika:playtest:{project.id}", json.dumps({
+            "commit": commit, "at": time.time(), "skipped": "the app does not serve a web page at /", "ok": True}))
+        return
+    result = run([SYSTEMD_RUN, f"--unit=laika-playtest-{project.id}", "--quiet", "--collect",
+                  "--property=RuntimeMaxSec=180", f"--description=LAIka play-test {project.id}",
+                  "/var/lib/laika/venv/bin/python", str(PLAYTEST_SCRIPT), project.id, "--port", str(port),
+                  "--commit", commit])
+    if result.returncode:
+        print(f"[laika-apps] play-test of {project.id}: {(result.stderr or result.stdout).strip()[:200]}", flush=True)
 
 
 ASSIST_SCRIPT = Path(__file__).resolve().parents[2] / "scripts/laika-assist.py"

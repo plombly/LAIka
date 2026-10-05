@@ -2,6 +2,46 @@
 
 All notable changes to LAIka. Versions follow [semantic versioning](https://semver.org).
 
+## 1.4.0
+
+- **Conversation proposes the goal.** When the idea is clear or it found the
+  cause of a problem, the goal-box Conversation ends its reply with a ready
+  goal: **Start this goal** or **Edit first**, no re-explaining.
+- **Live app log.** A project's app box has a **Live log**: the running
+  app's last 200 lines with times, how often it restarted and how it last
+  exited, following new lines as they come.
+- **Play-test.** After each deploy of a web app, LAIka opens its page in a
+  headless browser and reports errors on the page, failed requests, a blank
+  page and a screenshot, on the project page and as an "app looks broken"
+  notification. Settings → Project defaults → Play-test web apps.
+
+- **Project templates.** New project → **Start from a template**: Web game,
+  Website, API + website, Python web service, Command-line tool or Discord
+  bot. Each starts with working code, tests and a run command (apps listen
+  on the port LAIka assigns), so the first goal can be about features.
+- **Remote access through Tailscale.** Settings → Remote access installs
+  Tailscale and connects this server to your Tailscale account with a
+  sign-in link; it then lists the addresses of the dashboard, your apps and
+  SFTP on your private tailnet, reachable from your devices anywhere. No
+  port is opened to the internet: LAIka never enables Tailscale Funnel,
+  Serve or SSH, warns if they are on, and `laika doctor` fails on Funnel.
+- **Fewer review rounds.** A repair gets every blocking finding as a
+  checklist, fixes all of them (and other instances of the same mistake in
+  the change), and says what it changed for each; a review reports every
+  blocking problem in one round and starts a re-review by ticking off the
+  earlier findings. The review still checks the whole change.
+
+- **Phones over Tailscale.** Pairing codes and the app's info carry the
+  server's Tailscale addresses; the LAIka App tries them when the first
+  address does not answer.
+- Fixes from the move to the `laika` user: Flutter projects could not
+  install dependencies (the SDK now belongs to the laika user), every
+  project build failed with "no main branch yet" (host programs now always
+  use LAIka's git settings), and Android builds ran out of memory (the
+  build recipes fit Gradle into the build's 4 GB).
+- Planning interrupted by a restart is planned again; a goal-box
+  Conversation sees the app's state, port, log and recent failures.
+
 ## 1.3.1
 
 - Projects can be renamed: Settings → Name. Only the name shown changes;
