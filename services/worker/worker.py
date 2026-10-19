@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import pwd
@@ -7,6 +8,7 @@ import socket
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
@@ -18,6 +20,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import laika_env  # noqa: E402,F401  (Settings → environment, before any configuration is read)
 import agent_cli  # noqa: E402  (services/agent_cli.py)
 import network_access  # noqa: E402  (services/network_access.py)
+import provider_health  # noqa: E402  (services/provider_health.py)
+import provider_accounts  # noqa: E402  (services/provider_accounts.py)
+import redaction  # noqa: E402  (services/redaction.py)
+import candidate_safety  # noqa: E402  (services/candidate_safety.py)
+import safe_git  # noqa: E402  (services/safe_git.py)
+import job_events  # noqa: E402  (services/job_events.py)
 import project_reference  # noqa: E402  (services/project_reference.py)
 import laika_projects  # noqa: E402  (services/laika_projects.py)
 import project_sandbox  # noqa: E402  (services/project_sandbox.py)
@@ -96,7 +104,80 @@ def efficiency_prefix(role):
 {network_access.PROMPT_NOTE if role in ("builder", "repair") and PROJECT is not None and not PROJECT.is_builtin else ""}{GROUP_NOTE}
 """
 
-redis = Redis.from_url(REDIS_URL, password=laika_redis.password(), decode_responses=True)
+class StaleExecution(Exception):
+    """This worker's run of a job was taken away (the worker was declared
+    lost and the job re-run elsewhere): its late writes must not land."""
+
+
+class FencedRedis:
+    """The worker's Redis client: writes to a job this worker is running
+    (FENCES[key] = its execution id) land only while the job's execution_id
+    still names this run. Without it, a worker that stalled past the
+    lost-worker timeout and then woke up wrote its stale result over the
+    retry's record. Everything else passes straight through."""
+
+    _FENCED_WRITE = """
+local current = redis.call('HGET', KEYS[1], 'execution_id')
+if current ~= ARGV[1] then return redis.error_reply('STALE ' .. tostring(current)) end
+local op = ARGV[2]
+if op == 'hset' then return redis.call('HSET', KEYS[1], unpack(ARGV, 3)) end
+if op == 'hdel' then return redis.call('HDEL', KEYS[1], unpack(ARGV, 3)) end
+if op == 'hsetnx' then return redis.call('HSETNX', KEYS[1], ARGV[3], ARGV[4]) end
+return redis.error_reply('unknown op')
+"""
+
+    def __init__(self, client, fences=None):
+        self._client = client
+        self._fences = FENCES if fences is None else fences
+        self._script = None
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+    def _write(self, op, key, args, plain):
+        expected = self._fences.get(key)
+        if expected is None:
+            return plain()
+        if not hasattr(self._client, "register_script"):   # test doubles: same rule, not atomic
+            if self._client.hget(key, "execution_id") != expected:
+                raise StaleExecution(f"{key} now belongs to another run")
+            return plain()
+        if self._script is None:
+            self._script = self._client.register_script(self._FENCED_WRITE)
+        try:
+            return self._script(keys=[key], args=[expected, op, *args])
+        except Exception as exc:
+            if "STALE" in str(exc):
+                raise StaleExecution(f"{key} now belongs to another run") from None
+            raise
+
+    def hset(self, key, field=None, value=None, mapping=None):
+        fields = dict(mapping or {})
+        if field is not None:
+            fields[field] = value
+        before = None
+        if "status" in fields and job_events.job_id_of(key):
+            try:
+                before = self._client.hget(key, "status")
+            except Exception:
+                pass
+        pairs = [x for kv in fields.items() for x in kv]
+        result = self._write("hset", key, [str(x) for x in pairs],
+                             lambda: self._client.hset(key, mapping=fields))
+        if "status" in fields:  # the job's history (services/job_events.py)
+            job_events.record(self._client, key, before, fields["status"], fields, f"worker {WORKER_ID}")
+        return result
+
+    def hdel(self, key, *fields):
+        return self._write("hdel", key, list(fields), lambda: self._client.hdel(key, *fields))
+
+    def hsetnx(self, key, field, value):
+        return self._write("hsetnx", key, [field, str(value)], lambda: self._client.hsetnx(key, field, value))
+
+
+# key -> execution id of the job run this worker holds (FencedRedis).
+FENCES = {}
+redis = FencedRedis(Redis.from_url(REDIS_URL, password=laika_redis.password(), decode_responses=True))
 
 # The job this process is working on, published in every heartbeat. The
 # orchestrator treats work as in flight only while a live worker holds it
@@ -127,6 +208,9 @@ def worker_disabled():
         return False
 
 
+PAUSE_KEY = "laika:pause"
+
+
 def pause_reason():
     """Why this worker must not claim a new job now, or None: the operator
     stopped it ("disabled"), the scaler is removing it ("draining",
@@ -135,6 +219,8 @@ def pause_reason():
     if worker_disabled():
         return "disabled"
     try:
+        if redis.get(PAUSE_KEY):
+            return "paused"  # the operator paused all new work (running jobs finish)
         if redis.get(f"laika:worker-drain:{WORKER_ID}"):
             return "draining"
         if redis.get("laika:scaler:hold"):
@@ -218,18 +304,20 @@ class GitError(subprocess.CalledProcessError):
     def __str__(self):
         said = (self.stderr or self.stdout or "").strip().splitlines()
         detail = " / ".join(line.strip() for line in said[-3:] if line.strip())
-        return f"git {self.cmd[1] if len(self.cmd) > 1 else ''} failed (exit {self.returncode})" + (f": {detail[:400]}" if detail else "")
+        words = [part for part in self.cmd[1:] if not str(part).startswith("-") and "=" not in str(part)]
+        return f"git {words[0] if words else ''} failed (exit {self.returncode})" + (f": {detail[:400]}" if detail else "")
 
 
 def run_git(*args, cwd=None, check=True):
     check_worktree_pointer(cwd)
     try:
         return subprocess.run(
-            ["git", *args],
+            safe_git.command(*args),  # no hooks, no fsmonitor, no ext/file transports
             cwd=cwd or REPO_ROOT,  # resolved per call: the current job's project
             text=True,
             capture_output=True,
             check=check,
+            env=safe_git.env(),
         )
     except subprocess.CalledProcessError as exc:
         raise GitError(exc.returncode, exc.cmd, exc.stdout, exc.stderr) from None
@@ -431,14 +519,40 @@ def note_network_need(builder_id, gate_output, step, agent_text=""):
         redis.hset(key, mapping={**fields, "network_request_at": str(time.time())})
 
 
-def project_gate(worktree, timeout=900, network=False):
+def trusted_gate(worktree, base=None):
+    """(command, note) for a project's tests, chosen from trusted code: the
+    operator's gate_command, else what the base (main before this change)
+    implies. The change itself only decides when main had no tests yet; a
+    change that removes the tests main had fails (it could otherwise turn
+    its own checks off)."""
+    if PROJECT is None:
+        return "", ""
+    if PROJECT.gate_command:
+        return PROJECT.gate_command, ""
+    if base is None:
+        found = run_git("merge-base", "HEAD", PROJECT.default_branch, cwd=worktree, check=False)
+        base = found.stdout.strip() if found.returncode == 0 else ""
+    trusted = laika_projects.detect_gate_at(PROJECT.repo, base) if base else ""
+    current = laika_projects.detect_gate(worktree)
+    if trusted and not current:
+        return None, (f"main ({base[:12]}) had tests ({trusted}) but this change has none: "
+                      "the change removed the project's tests or their setup")
+    if trusted and current != trusted:
+        return trusted, f"tests chosen from main ({trusted}); the change would have run {current or 'nothing'}\n"
+    return trusted or current, ""
+
+
+def project_gate(worktree, timeout=900, network=False, base=None):
     """(ok, output) of a non-LAIka project's own gate command, run in worktree.
-    An empty gate command is detected from the worktree (detect_gate).
+    An empty gate command is chosen from trusted code (trusted_gate).
     network=True: the operator allowed internet access for these tests."""
     setup_ok, setup_output = project_setup(worktree)
     if not setup_ok:
         return False, setup_output + "\ndependency setup failed; tests were not run\n"
-    command = (PROJECT.gate_command or laika_projects.detect_gate(worktree)) if PROJECT else ""
+    command, note = trusted_gate(worktree, base)
+    if command is None:
+        return False, setup_output + note + "\n"
+    setup_output += note
     if not command:
         return True, setup_output + f"no gate command configured or detected for project {PROJECT.id if PROJECT else '?'}; nothing to run\n"
     # A gate must leave the worktree as it found it: files it creates (caches,
@@ -552,25 +666,33 @@ def _prepare_integration_locked(job_id, key):
                 run_git("cherry-pick", "--abort", cwd=path, check=False)
                 raise RuntimeError(f"cannot apply source candidate {source}: {result.stderr.strip()}")
 
+        # The worker is the attacker: links out of the repository, submodules
+        # and odd paths are refused; sensitive files are named for review.
+        integrated_head = run_git("rev-parse", "HEAD", cwd=path).stdout.strip()
+        safety = candidate_safety.inspect(lambda *a: run_git(*a, cwd=path).stdout, base, integrated_head)
+        redis.hset(key, mapping={"sensitive_paths": json.dumps(safety["sensitive"])})
+        if safety["refused"]:
+            raise RuntimeError("change refused by the safety check: " + "; ".join(safety["refused"][:10]))
+
+        gate_started = time.time()
         if PROJECT is not None and not PROJECT.is_builtin:
-            gate_ok, gate_output = project_gate(path, network=gate_network(job_id))
+            gate_command = trusted_gate(path, base)[0] or ""
+            gate_ok, gate_output = project_gate(path, network=gate_network(job_id), base=base)
             if not gate_ok:
                 note_network_need(job_id, gate_output, "integration tests")
             gate = subprocess.CompletedProcess([], 0 if gate_ok else 1, gate_output, "")
         else:
-            env = os.environ.copy()
-            env["REPO_ROOT"] = str(path)
-            gate = subprocess.run(
-                [str(path / "scripts/integration-check.py")],
-                cwd=path, env=env, text=True, capture_output=True,
-            )
+            gate_command = f"scripts/integration-check.py (from {base[:12]})"
+            gate = run_builtin_gate(path, base)
+        integration_metadata.update(command=gate_command, seconds=round(time.time() - gate_started, 1),
+                                    checks=gate_checks(gate.stdout))
         integrated = run_git("rev-parse", "HEAD", cwd=path).stdout.strip()
-        integration_metadata = {
+        integration_metadata.update({
             "returncode": gate.returncode,
             "stdout": gate.stdout[-4000:],
             "stderr": gate.stderr[-4000:],
             "commit": integrated,
-        }
+        })
         if gate.returncode != 0:
             raise RuntimeError("deterministic integration gate failed")
 
@@ -599,6 +721,80 @@ def _prepare_integration_locked(job_id, key):
             "updated_at": str(time.time()),
         })
         return False
+
+
+def git_control_files(worktree):
+    """{path: bytes} of what makes git run code or change meaning: the shared
+    config, hooks and info/attributes of the repository, and this
+    worktree's own config. An agent never has a reason to touch them."""
+    common = run_git("rev-parse", "--git-common-dir", cwd=worktree).stdout.strip()
+    private = run_git("rev-parse", "--git-dir", cwd=worktree).stdout.strip()
+    common, private = (Path(worktree) / common).resolve(), (Path(worktree) / private).resolve()
+    files = {}
+    candidates = [common / "config", common / "info" / "attributes", private / "config.worktree"]
+    hooks = common / "hooks"
+    if hooks.is_dir():
+        candidates += sorted(p for p in hooks.iterdir() if p.is_file())
+    for path in candidates:
+        try:
+            files[str(path)] = path.read_bytes() if path.is_file() and not path.is_symlink() else None
+        except OSError:
+            files[str(path)] = None
+    return files
+
+
+@contextlib.contextmanager
+def guard_git_control(worktree):
+    """Run an agent; if it changed git's config, hooks or attributes, put
+    them back and fail the job (sandboxed projects cannot; LAIka's own jobs
+    and sandbox-off installs could)."""
+    before = git_control_files(worktree)
+    yield
+    after = git_control_files(worktree)
+    changed = sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
+    if not changed:
+        return
+    for path in changed:
+        original = before.get(path)
+        try:
+            if original is None:
+                Path(path).unlink(missing_ok=True)
+            else:
+                Path(path).write_bytes(original)
+        except OSError as exc:
+            print(f"[{WORKER_ID}] could not restore {path}: {exc}", flush=True)
+    raise RuntimeError("the agent changed git configuration or hooks (restored): " + ", ".join(changed[:5]))
+
+
+_CHECK_LINE = re.compile(r"^\[\s*(PASS|FAIL|SKIP)\s*\]\s+(\S+)(?:\s+\(([\d.]+)s\))?")
+
+
+def gate_checks(output):
+    """[{name, result, seconds}] from LAIka's gate lines ("[ PASS ] host-tests (45.2s)")."""
+    checks = []
+    for line in str(output or "").splitlines():
+        match = _CHECK_LINE.match(line.strip())
+        if match:
+            checks.append({"name": match.group(2), "result": match.group(1).lower(),
+                           "seconds": float(match.group(3)) if match.group(3) else None})
+    return checks[:60]
+
+
+def run_builtin_gate(path, base):
+    """LAIka's own gate for an integrated candidate, run from the BASE's copy
+    of scripts/integration-check.py: a change cannot edit the list of checks
+    that judge it (its new gate applies once it is on main)."""
+    script = run_git("show", f"{base}:scripts/integration-check.py", cwd=path, check=False)
+    if script.returncode != 0:
+        return subprocess.CompletedProcess([], 1, "", "the base has no scripts/integration-check.py")
+    with tempfile.NamedTemporaryFile("w", suffix="-integration-check.py", delete=False) as handle:
+        handle.write(script.stdout)
+    try:
+        env = os.environ.copy()
+        env["REPO_ROOT"] = str(path)
+        return subprocess.run([LAIKA_PYTHON, handle.name], cwd=path, env=env, text=True, capture_output=True)
+    finally:
+        os.unlink(handle.name)
 
 
 def create_worktree(job_id, suffix=""):
@@ -706,7 +902,14 @@ def parse_codex_log(log_path):
     return session_id, usage
 
 
-def run_codex(job, worktree, log_path):
+CODEX_ISOLATION = tuple(arg for feature in (
+    "plugins", "apps", "hooks", "browser_use", "computer_use", "image_generation", "remote_plugin",
+    "skill_mcp_dependency_install") for arg in ("--disable", feature))
+
+
+def run_codex(job, worktree, log_path, account=None):
+    """account: which Codex account (provider_accounts; None = default)."""
+    account = account or provider_accounts.DEFAULT
     model = job.get("model", DEFAULT_MODEL)
     prompt = job["prompt"]
     role = job.get("role", "builder")
@@ -732,17 +935,22 @@ def run_codex(job, worktree, log_path):
         "exec",
         "--model", model,
         "--sandbox", sandbox,
-        "--ephemeral",
+        # Not --ephemeral: the session file is the only place Codex reports
+        # plan usage; LAIka reads it and deletes it (agent_cli.record_codex_limits).
         "--color", "never",
         "--json",
+        # Nothing beyond reading, editing and running commands in the
+        # worktree: no plugins/apps/hooks, no browser or computer control.
+        *CODEX_ISOLATION,
         "--cd", str(worktree),
         "-",
     ]
 
-    env = os.environ.copy()
-    env["HOME"] = os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
+    env = agent_cli.agent_env()
+    env = provider_accounts.apply_env(env, provider_accounts.env_for("codex", account, base=env["HOME"]))
     # Projects: inside the project sandbox (reviewers read-only).
-    command = project_sandbox.codex_command(command, PROJECT, worktree, writable=(role != "reviewer"))
+    state = () if account == provider_accounts.DEFAULT else (provider_accounts.codex_home(account, env["HOME"]),)
+    command = project_sandbox.codex_command(command, PROJECT, worktree, writable=(role != "reviewer"), state=state)
 
     started = time.time()
 
@@ -773,7 +981,8 @@ def run_codex(job, worktree, log_path):
 
             if time.time() - started >= runtime_limit:
                 timed_out = True
-                os.killpg(process.pid, signal.SIGTERM)
+                stop_process_group(process)
+                break
 
             _, live_usage = parse_codex_log(log_path)
             live_effective = int(live_usage.get("effective_tokens") or 0)
@@ -786,11 +995,11 @@ def run_codex(job, worktree, log_path):
                 and live_usage.get("turn_completed") != "1"
                 and process.poll() is None
             ):
-                os.killpg(process.pid, signal.SIGTERM)
+                agent_cli.kill_group(process.pid, signal.SIGTERM)
                 try:
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    agent_cli.kill_group(process.pid, signal.SIGKILL)
                     process.wait()
                 raise RuntimeError(
                     f"Codex effective-token budget exceeded: {live_effective} >= {enforcement_budget} "
@@ -799,12 +1008,35 @@ def run_codex(job, worktree, log_path):
 
             time.sleep(POLL_SECONDS)
 
+        # Nothing the agent started may outlive it (a dev server, a watcher):
+        # LAIka's own jobs have no sandbox to take them down.
+        kill_leftovers(process)
+        # The account's plan usage (and its session file removed).
+        agent_cli.record_codex_limits(redis, log_path, provider_accounts.codex_home(account, env["HOME"]),
+                                      account=account)
+
         if timed_out:
             raise RuntimeError(
                 f"Codex exceeded {runtime_limit} second {role} timeout"
             )
 
     return process.returncode, time.time() - started
+
+
+def stop_process_group(process, grace=10):
+    """SIGTERM the agent's process group, SIGKILL it if it is still there
+    after grace seconds (a Codex that ignored SIGTERM hung the worker)."""
+    agent_cli.kill_group(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        agent_cli.kill_group(process.pid, signal.SIGKILL)
+        process.wait()
+
+
+def kill_leftovers(process):
+    """SIGKILL whatever is left in the agent's process group after it exited."""
+    agent_cli.kill_group(process.pid, signal.SIGKILL)
 
 
 def repair_allowed_bash():
@@ -825,7 +1057,7 @@ def repair_allowed_bash():
     return (f"Bash({LAIKA_PYTHON} -m pytest *)", "Bash(node apps/web/app.test.js)") + allowed
 
 
-def run_review_aspects(job, worktree, log_path, timeout):
+def run_review_aspects(job, worktree, log_path, timeout, account=None):
     """Run the configured specialist reviews concurrently and combine them
     into one Claude result at log_path (see agent_cli.combined_review_result).
     Returns an unavailable/failed run as-is so run_agent can fall back."""
@@ -838,7 +1070,8 @@ def run_review_aspects(job, worktree, log_path, timeout):
                   + agent_cli.REVIEW_ASPECT_FOCUS[aspect])
         run = agent_cli.run_claude(
             "reviewer", prompt, worktree, log_path.with_name(f"{log_path.stem}.{aspect}.json"),
-            timeout, model=model, tick=lambda: heartbeat("working"), wrap=agent_sandbox(worktree))
+            timeout, model=model, tick=lambda: heartbeat("working"), wrap=agent_sandbox(worktree),
+            account=account)
         if run.result is not None:
             run.result["_model"] = model
         runs[aspect] = run
@@ -851,14 +1084,14 @@ def run_review_aspects(job, worktree, log_path, timeout):
     for aspect in aspects:
         run = runs.get(aspect)
         if run is None or not run.ok:
-            return run or agent_cli.ClaudeRun(1, 0.0, None)  # unavailable/failed: caller decides
+            return run or agent_cli.ClaudeRun(1, 0.0, None, account=account)  # unavailable/failed: caller decides
     verdicts = {a: parse_review_verdict([runs[a].text])[0] for a in aspects}
     missing = [a for a, v in verdicts.items() if v == "unknown"]
     if missing:
         raise RuntimeError(f"specialist review(s) gave no verdict: {', '.join(missing)}")
     combined = agent_cli.combined_review_result(runs, verdicts)
     log_path.write_text(json.dumps(combined))
-    return agent_cli.ClaudeRun(0, max(r.duration for r in runs.values()), combined)
+    return agent_cli.ClaudeRun(0, max(r.duration for r in runs.values()), combined, account=account)
 
 
 # --- best-of-N builds -------------------------------------------------------------
@@ -892,7 +1125,7 @@ def change_size(worktree):
     return total
 
 
-def run_alternate_builder(job, provider, worktree, log_path, timeout):
+def run_alternate_builder(job, provider, worktree, log_path, timeout, account=None):
     """(ok, duration, cost_usd, model) for the alternate provider's build."""
     started = time.time()
     if provider == "claude":
@@ -900,13 +1133,27 @@ def run_alternate_builder(job, provider, worktree, log_path, timeout):
         run = agent_cli.run_claude(
             "builder", efficiency_prefix("builder") + job["prompt"], worktree, log_path, timeout,
             model=model, allowed_bash=repair_allowed_bash(), tick=lambda: heartbeat("working"),
-            wrap=agent_sandbox(worktree))
+            wrap=agent_sandbox(worktree), account=account)
         cost = agent_cli.claude_usage(run.result)["cost_usd"] if run.result else ""
         return run.ok, run.duration, cost, model
     independent = {**job, "role": "builder", "prompt": job["prompt"] + (
         "\n\nThis is an independent second attempt built in parallel with another. "
         "Prefer the simplest correct approach and keep the change small.")}
-    returncode, duration = run_codex(independent, worktree, log_path)
+    holder = f"job:{job['id']}:alt"
+    account = provider_accounts.acquire(redis, "codex", holder, timeout + 120)
+    if not account:  # every Codex account paused, off or busy: no second build this time
+        raise RuntimeError("no Codex account is free for the second build")
+    try:
+        returncode, duration = run_codex(independent, worktree, log_path, account=account)
+    finally:
+        provider_accounts.release(redis, "codex", account, holder)
+    if returncode != 0:  # the account's limit or sign-in: hold it like any other run would
+        try:
+            failure = provider_health.codex_failure(Path(log_path).read_text(errors="replace"))
+        except OSError:
+            failure = None
+        if failure is not None and failure.holds:
+            provider_health.hold(redis, "codex", failure, account=account)
     return returncode == 0, duration, "", job.get("model", DEFAULT_MODEL)
 
 
@@ -922,13 +1169,13 @@ def run_best_of(job, worktree, log_path):
     timeout = int(job.get("timeout_seconds") or role_limit(
         "builder", "TIMEOUT_SECONDS", ROLE_RUNTIME_DEFAULTS))
     slot = f"job:{job_id}:alt"
-    if alt_provider == "claude" and (
-        agent_cli.claude_cooling_down(redis)
-        or not agent_cli.wait_for_claude_slot(redis, slot, timeout + 120, 60,
-                                              tick=lambda: heartbeat("working"))
-    ):
-        redis.hset(key, "best_of", json.dumps({"skipped": "claude unavailable or at capacity"}))
-        return run_agent(job, worktree, log_path)
+    alt_account = None
+    if alt_provider == "claude":
+        alt_account = None if agent_cli.claude_cooling_down(redis) else agent_cli.wait_for_claude_slot(
+            redis, slot, timeout + 120, 60, tick=lambda: heartbeat("working"))
+        if not alt_account:
+            redis.hset(key, "best_of", json.dumps({"skipped": "claude unavailable or at capacity"}))
+            return run_agent(job, worktree, log_path)
 
     _, alt_worktree = create_worktree(job_id, "-alt")
     alt_log = log_path.with_name(f"{log_path.stem}.alt{log_path.suffix}")
@@ -937,12 +1184,16 @@ def run_best_of(job, worktree, log_path):
     def primary():
         try:
             results["primary"] = run_agent(job, worktree, log_path)
+        except ProviderWait as exc:  # waits for its provider unless the other build passes
+            results["primary_wait"] = exc
+            results["primary_error"] = str(exc)
         except Exception as exc:
             results["primary_error"] = str(exc)
 
     def alternate():
         try:
-            results["alt"] = run_alternate_builder(job, alt_provider, alt_worktree, alt_log, timeout)
+            results["alt"] = run_alternate_builder(job, alt_provider, alt_worktree, alt_log, timeout,
+                                                   account=alt_account)
         except Exception as exc:
             results["alt_error"] = str(exc)
 
@@ -955,7 +1206,7 @@ def run_best_of(job, worktree, log_path):
             thread.join()
     finally:
         if alt_provider == "claude":
-            agent_cli.release_claude_slot(redis, slot)
+            agent_cli.release_claude_slot(redis, slot, alt_account)
 
     report = {"primary": {"provider": primary_provider}, "alt": {"provider": alt_provider}}
     candidates = {}
@@ -996,10 +1247,83 @@ def run_best_of(job, worktree, log_path):
     print(f"[{WORKER_ID}] job={job_id} best-of: {json.dumps(report)}", flush=True)
 
     if chosen == "primary" and "primary" not in candidates:
+        if "primary_wait" in results:
+            raise results["primary_wait"]
         if "primary" in results:
             return results["primary"]
         raise RuntimeError(f"best-of build failed: {report}")
     return 0, max(results.get("primary", (0, 0))[1], (alt or (0, 0))[1])
+
+
+class ProviderWait(Exception):
+    """No provider can serve this job right now (quota, rate limit, sign-in,
+    outage). Builders wait for it without using up an attempt
+    (orchestrator resume_deferred_jobs)."""
+
+    def __init__(self, provider, failure, account=None):
+        self.provider, self.failure, self.account = provider, failure, account
+        # Another account of the provider can take it at once: a switch, not a wait.
+        self.switch = not provider_health.held(redis, provider)
+        until = provider_health.info(redis, provider).get("until") or failure.until
+        self.until = until
+        super().__init__(f"{provider}{f' ({account})' if account and account != provider_accounts.DEFAULT else ''} "
+                         f"{failure.kind}: {failure.reason}")
+
+
+MAX_PROVIDER_DEFERRALS = int(os.environ.get("MAX_PROVIDER_DEFERRALS", "6"))
+
+
+def provider_wait_fields(builder_id, exc, kind, job_id):
+    """Builder fields for a review or repair that no provider could serve
+    (ProviderWait): the orchestrator retries it once the provider is back,
+    without using a review recovery or a repair attempt. Bounded by
+    MAX_PROVIDER_DEFERRALS waits; past that (or for any other failure) the
+    usual rules apply."""
+    if not isinstance(exc, ProviderWait):
+        return {}
+    builder = redis.hgetall(f"laika:jobs:{builder_id}") or {}
+    waits = int(builder.get(f"{kind}_waits") or 0)
+    if waits >= MAX_PROVIDER_DEFERRALS:
+        return {}
+    fields = {f"{kind}_wait_provider": exc.provider, f"{kind}_waits": str(waits + 1),
+              f"{kind}_wait_until": str(exc.until or (time.time() + 300))}
+    if kind == "repair":
+        # The attempt that could not run is given back.
+        fields.update(repair_status="waiting", last_repair_job_id=job_id,
+                      repair_attempts=str(max(0, int(builder.get("repair_attempts") or 0) - 1)))
+    return fields
+
+
+def codex_or_wait(job, worktree, log_path):
+    """run_codex, turning a Codex quota/rate/sign-in failure into a hold on
+    Codex plus ProviderWait instead of an ordinary failed build."""
+    if provider_health.held(redis, "codex"):
+        detail = provider_health.info(redis, "codex")
+        raise ProviderWait("codex", provider_health.Failure(detail.get("kind", "unavailable"),
+                                                            detail.get("reason", "on hold"), detail.get("until")))
+    holder = f"job:{job['id']}"
+    timeout = int(job.get("timeout_seconds") or role_limit(job.get("role", "builder"), "TIMEOUT_SECONDS",
+                                                           ROLE_RUNTIME_DEFAULTS))
+    account = provider_accounts.wait(redis, "codex", holder, timeout + 120,
+                                     int(os.environ.get("CODEX_SLOT_WAIT_SECONDS", "900")),
+                                     tick=lambda: heartbeat("working"))
+    if not account:
+        raise ProviderWait("codex", provider_health.Failure("rate", "every Codex account is busy"))
+    redis.hset(f"laika:jobs:{job['id']}", "provider_account", account)
+    try:
+        returncode, duration = run_codex(job, worktree, log_path, account=account)
+    finally:
+        provider_accounts.release(redis, "codex", account, holder)
+    if returncode != 0:
+        try:
+            failure = provider_health.codex_failure(Path(log_path).read_text(errors="replace"))
+        except OSError:
+            failure = None
+        if failure is not None and failure.holds:
+            provider_health.hold(redis, "codex", failure, account=account)
+            print(f"[{WORKER_ID}] job={job['id']} codex ({account}) {failure.kind}: {failure.reason}", flush=True)
+            raise ProviderWait("codex", failure, account=account)
+    return returncode, duration
 
 
 def run_agent(job, worktree, log_path):
@@ -1017,22 +1341,26 @@ def run_agent(job, worktree, log_path):
         provider, fallback = "codex", "claude cooling down after an unavailable response"
 
     slot = f"job:{job['id']}"
+    account = None
     if provider == "claude":
         timeout = int(job.get("timeout_seconds") or role_limit(
             role, "TIMEOUT_SECONDS", ROLE_RUNTIME_DEFAULTS))
         redis.hset(key, mapping={"provider_wait": "waiting for a claude slot",
                                  "updated_at": str(time.time())})
-        if not agent_cli.wait_for_claude_slot(
-                redis, slot, timeout + 120,
-                int(os.environ.get("CLAUDE_SLOT_WAIT_SECONDS", "900")),
-                tick=lambda: heartbeat("working")):
-            provider, fallback = "codex", "claude at capacity (CLAUDE_MAX_CONCURRENT)"
+        account = agent_cli.wait_for_claude_slot(
+            redis, slot, timeout + 120,
+            int(os.environ.get("CLAUDE_SLOT_WAIT_SECONDS", "900")),
+            tick=lambda: heartbeat("working"))
+        if not account:
+            provider, fallback = "codex", "claude at capacity (every account's concurrent runs in use)"
         redis.hset(key, "provider_wait", "")
 
-    if provider == "claude":
+    tried = set()
+    while provider == "claude" and account:
+        switch_to = None
         try:
             model = agent_cli.claude_model(role)
-            redis.hset(key, mapping={"provider": "claude", "model": model,
+            redis.hset(key, mapping={"provider": "claude", "model": model, "provider_account": account,
                                      "updated_at": str(time.time())})
             CURRENT_AGENT.update(provider="claude", model=model)
             heartbeat("working")
@@ -1042,9 +1370,10 @@ def run_agent(job, worktree, log_path):
                 run = agent_cli.run_claude(
                     role, efficiency_prefix(role) + job["prompt"] + REBASE_CHECK_NOTE, worktree,
                     log_path, timeout, model=model, tick=lambda: heartbeat("working"),
-                    tools="", wrap=agent_sandbox(worktree))  # one turn: everything it needs is in the prompt
+                    tools="", wrap=agent_sandbox(worktree),  # one turn: everything it needs is in the prompt
+                    account=account)
             elif role == "reviewer" and len(agent_cli.review_aspects()) > 1:
-                run = run_review_aspects(job, worktree, log_path, timeout)
+                run = run_review_aspects(job, worktree, log_path, timeout, account=account)
             else:
                 run = agent_cli.run_claude(
                     role, efficiency_prefix(role) + job["prompt"], worktree, log_path, timeout,
@@ -1052,11 +1381,23 @@ def run_agent(job, worktree, log_path):
                     allowed_bash=repair_allowed_bash() if role in ("builder", "repair") else (),
                     tick=lambda: heartbeat("working"),
                     wrap=agent_sandbox(worktree),
+                    account=account,
                 )
+            try:
+                agent_cli.record_rate_limits(redis, log_path, account=account)
+            except Exception as exc:  # a usage reading is a bonus, never a failure
+                print(f"[{WORKER_ID}] claude usage reading: {exc}", flush=True)
             if run.unavailable:
                 fallback = f"claude unavailable: {run.describe_error()}"
-                agent_cli.start_cooldown(redis, fallback)
-                print(f"[{WORKER_ID}] job={job['id']} {fallback}; falling back to codex", flush=True)
+                agent_cli.start_cooldown(redis, fallback, failure=run.failure, account=account)
+                # Another Claude account may still serve it (several accounts).
+                tried.add(account)
+                other = agent_cli.acquire_claude_slot(redis, slot, timeout + 120)
+                if other and other not in tried:
+                    redis.hset(key, "account_switches", str(int(redis.hget(key, "account_switches") or 0) + 1))
+                    switch_to = other
+                elif other:
+                    agent_cli.release_claude_slot(redis, slot, other)
             elif run.timed_out:
                 raise RuntimeError(f"Claude exceeded {timeout} second {role} timeout")
             elif not run.ok:
@@ -1068,7 +1409,12 @@ def run_agent(job, worktree, log_path):
                 })
                 return 0, run.duration
         finally:
-            agent_cli.release_claude_slot(redis, slot)
+            agent_cli.release_claude_slot(redis, slot, account)
+        if not switch_to:
+            print(f"[{WORKER_ID}] job={job['id']} {fallback}; falling back to codex", flush=True)
+            break
+        print(f"[{WORKER_ID}] job={job['id']} {fallback}; trying Claude account {switch_to}", flush=True)
+        account = switch_to
 
     model = job.get("model", DEFAULT_MODEL)
     redis.hset(key, mapping={"provider": "codex", "model": model,
@@ -1076,7 +1422,7 @@ def run_agent(job, worktree, log_path):
                              "updated_at": str(time.time())})
     CURRENT_AGENT.update(provider="codex", model=model)
     heartbeat("working")
-    return run_codex(job, worktree, log_path)
+    return codex_or_wait(job, worktree, log_path)
 
 
 def run_tests(worktree, network=False):
@@ -1132,19 +1478,19 @@ def review_diff_packet(builder, candidate_commit, worktree):
     """
     base = builder.get("integration_base_commit") or f"{candidate_commit}^"
     stat = run_git(
-        "diff", "--stat=200", base, candidate_commit,
+        "diff", *safe_git.DIFF_SAFETY, "--stat=200", base, candidate_commit,
         cwd=worktree, check=False,
     ).stdout.strip() or "(no file changes reported)"
     names = [
         name for name in run_git(
-            "diff", "--name-only", base, candidate_commit,
+            "diff", *safe_git.DIFF_SAFETY, "--name-only", base, candidate_commit,
             cwd=worktree, check=False,
         ).stdout.splitlines() if name.strip()
     ]
     chunks, used, omitted = [], 0, []
     for name in names:
         piece = run_git(
-            "diff", "--no-ext-diff", "--unified=20", base, candidate_commit,
+            "diff", *safe_git.DIFF_SAFETY, "--unified=20", base, candidate_commit,
             "--", name, cwd=worktree, check=False,
         ).stdout or ""
         if used + len(piece) > REVIEW_DIFF_CHARS:
@@ -1153,6 +1499,13 @@ def review_diff_packet(builder, candidate_commit, worktree):
         chunks.append(piece)
         used += len(piece)
     diff = "".join(chunks) or "(empty diff)"
+    try:
+        sensitive = json.loads(builder.get("sensitive_paths") or "[]")
+    except ValueError:
+        sensitive = []
+    if sensitive:
+        diff = ("[LAIka: this change touches files that steer tests, git or agents; check them "
+                "especially carefully: " + ", ".join(sensitive[:20]) + "]\n" + diff)
     if omitted:
         diff += (
             "\n[LAIka: diff budget reached; these changed files were not "
@@ -1196,6 +1549,46 @@ def prior_findings_packet(builder):
         "Previous review findings for this job (the repair was meant to "
         f"address these):\n{body}\n\n"
     )
+
+
+def acceptance_criteria(builder):
+    """The planner's acceptance criteria for a builder job ([] for older jobs)."""
+    try:
+        criteria = json.loads(builder.get("acceptance") or "[]")
+    except ValueError:
+        return []
+    return [str(c) for c in criteria if str(c).strip()] if isinstance(criteria, list) else []
+
+
+def criteria_review_note(criteria):
+    if not criteria:
+        return ""
+    lines = "\n".join(f"{n}. {c}" for n, c in enumerate(criteria, 1))
+    return (f"Acceptance criteria for this job (from the plan):\n{lines}\n\n"
+            "Before the verdict, add one line per criterion, exactly:\n"
+            "CRITERION <number>: MET - <the evidence in the change>\n"
+            "or CRITERION <number>: NOT MET - <what is missing>\n"
+            "A criterion that is NOT MET is a BLOCKING finding.\n\n")
+
+
+_CRITERION = re.compile(r"^\s*\**\s*CRITERION\s+(\d+)\s*\**\s*:\s*(MET|NOT MET)\b\s*[-:–—]?\s*(.*)$", re.IGNORECASE)
+
+
+def parse_criteria_review(messages, criteria):
+    """[{criterion, met (True/False/None), note}] from the reviewer's lines;
+    None when the reviewer said nothing about a criterion."""
+    found = {}
+    for text in messages or []:
+        for line in str(text).splitlines():
+            match = _CRITERION.match(line)
+            if match and 1 <= int(match.group(1)) <= len(criteria):
+                number, met = int(match.group(1)), match.group(2).upper() == "MET"
+                # Several specialist reviews may judge the same criterion:
+                # one NOT MET wins (it is a blocking finding).
+                if number not in found or (found[number][0] and not met):
+                    found[number] = (met, match.group(3).strip()[:300])
+    return [{"criterion": c, "met": found.get(n, (None, ""))[0], "note": found.get(n, (None, ""))[1]}
+            for n, c in enumerate(criteria, 1)]
 
 
 def parse_review_verdict(messages):
@@ -1314,6 +1707,7 @@ def queue_review_job(builder_job_id):
         main_changes = main_changes_packet(builder["reviewed_base_commit"], review_base, Path(worktree))
     gate_summary = integration_gate_summary(builder)
     prior_findings = prior_findings_packet(builder)
+    criteria = acceptance_criteria(builder)
 
     prompt = f"""You are the review agent for LAIka.
 
@@ -1367,7 +1761,7 @@ findings back for a later round.
 Read surrounding code only to validate a concrete concern. Do not modify any
 files. Do not commit anything.
 
-End your response with exactly one verdict line:
+{criteria_review_note(criteria)}End your response with exactly one verdict line:
 VERDICT: PASS
 or
 VERDICT: PASS_WITH_NOTES
@@ -1514,6 +1908,7 @@ def process_review_job(job, key, log_path):
     messages = agent_cli.agent_messages(log_path)
 
     verdict, findings = parse_review_verdict(messages)
+    criteria_review = parse_criteria_review(messages, acceptance_criteria(builder))
 
     common = {
         "review_verdict": verdict,
@@ -1556,6 +1951,7 @@ def process_review_job(job, key, log_path):
         "reviewed_base_commit": str(builder.get("integration_base_commit") or "") if verdict == "pass" else "",
         "review_aspects": review_aspects_json,
         "review_job_id": job_id,
+        "acceptance_review": json.dumps(criteria_review),
         "review_status": "complete",
         "review_verdict": verdict,
         "review_findings": findings,
@@ -1676,7 +2072,8 @@ def process_repair_job(job, key, log_path, test_log):
     )
 
     try:
-        returncode, duration = run_agent(job, worktree, log_path)
+        with guard_git_control(worktree):
+            returncode, duration = run_agent(job, worktree, log_path)
         session_id, usage = parse_codex_log(log_path)
 
         common = {
@@ -2029,7 +2426,11 @@ def process_job(raw_job):
         job_key = f"laika:jobs:{CURRENT_JOB_ID}"
         if redis.exists(job_key):
             CURRENT_JOB_STARTED_AT = str(time.time())
-            redis.hset(job_key, "started_at", CURRENT_JOB_STARTED_AT)
+            # This run's identity: every later write to the job must match it.
+            execution = uuid.uuid4().hex
+            redis.hset(job_key, mapping={"started_at": CURRENT_JOB_STARTED_AT, "execution_id": execution,
+                                         "executions": str(int(redis.hget(job_key, "executions") or 0) + 1)})
+            FENCES[job_key] = execution
             redis.hdel(job_key, "finished_at")
         else:
             CURRENT_JOB_STARTED_AT = ""
@@ -2041,11 +2442,18 @@ def process_job(raw_job):
         heartbeat("working")
         with keep_alive("working"):
             _process_job(raw_job)
+    except StaleExecution as exc:
+        # Declared lost and re-run elsewhere: leave the job to that run.
+        print(f"[{WORKER_ID}] job={CURRENT_JOB_ID} taken over by another run; stopped ({exc})", flush=True)
     finally:
         if CURRENT_JOB_ID:
             job_key = f"laika:jobs:{CURRENT_JOB_ID}"
-            if redis.exists(job_key):
-                redis.hset(job_key, "finished_at", str(time.time()))
+            try:
+                if redis.exists(job_key):
+                    redis.hset(job_key, "finished_at", str(time.time()))
+            except StaleExecution:
+                pass
+            FENCES.pop(job_key, None)
         CURRENT_JOB_ID = CURRENT_JOB_ROLE = CURRENT_JOB_STARTED_AT = ""
         CURRENT_AGENT.clear()
         use_project(None)
@@ -2132,10 +2540,11 @@ def _process_job(raw_job):
             },
         )
 
-        if best_of_enabled(job):
-            returncode, duration = run_best_of(job, worktree, log_path)
-        else:
-            returncode, duration = run_agent(job, worktree, log_path)
+        with guard_git_control(worktree):
+            if best_of_enabled(job):
+                returncode, duration = run_best_of(job, worktree, log_path)
+            else:
+                returncode, duration = run_agent(job, worktree, log_path)
         session_id, usage = parse_codex_log(log_path)
 
         redis.hset(
@@ -2257,11 +2666,28 @@ def _process_job(raw_job):
         )
 
     except Exception as exc:
+        if isinstance(exc, ProviderWait) and job.get("role", "builder") in ("", "builder"):
+            # Nobody could build it right now: wait for the provider without
+            # using up a build attempt (orchestrator resume_deferred_jobs).
+            # Another account of the provider is free: a switch, counted on
+            # its own (several accounts must not use up the provider waits).
+            counter = "account_switches" if exc.switch else "deferrals"
+            redis.hset(key, mapping={
+                "status": "deferred",
+                "defer_kind": "provider",
+                "defer_provider": exc.provider,
+                "defer_until": str(exc.until or (time.time() + 300)),
+                "defer_reason": redaction.redact(str(exc))[:500],
+                counter: str(int(redis.hget(key, counter) or 0) + 1),
+                "updated_at": str(time.time()),
+            })
+            print(f"[{WORKER_ID}] job={job_id} deferred: {exc}", flush=True)
+            return
         redis.hset(
             key,
             mapping={
                 "status": "failed",
-                "error": str(exc),
+                "error": redaction.redact(str(exc)),
                 "updated_at": str(time.time()),
             },
         )
@@ -2275,8 +2701,9 @@ def _process_job(raw_job):
                     f"laika:jobs:{target_builder_id}",
                     mapping={
                         "repair_status": "failed",
-                        "repair_error": str(exc),
+                        "repair_error": redaction.redact(str(exc)),
                         "updated_at": str(time.time()),
+                        **provider_wait_fields(target_builder_id, exc, "repair", job_id),
                     },
                 )
                 redis.hdel(
@@ -2291,8 +2718,9 @@ def _process_job(raw_job):
                     f"laika:jobs:{builder_job_id}",
                     mapping={
                         "review_status": "failed",
-                        "review_error": str(exc),
+                        "review_error": redaction.redact(str(exc)),
                         "updated_at": str(time.time()),
+                        **provider_wait_fields(builder_job_id, exc, "review", job_id),
                     },
                 )
 

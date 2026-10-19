@@ -106,6 +106,16 @@ FIELDS = [
        choice_labels={"spec": "Does exactly what was asked", "safety": "Security and safety"}),
     _f("MAX_REPAIR_ATTEMPTS", "ai", "Repairs before asking you", "int", 2, min=0, max=10),
     _f("MAX_BUILD_ATTEMPTS", "ai", "Rebuilds before asking you", "int", 2, min=1, max=10),
+    _f("MAX_PROVIDER_DEFERRALS", "ai", "Provider waits before a build counts as failed", "int", 6,
+       "A build no provider could take (usage limit, rate limit, sign-in) waits for the provider's reset "
+       "without using an attempt, up to this many times.", min=1, max=50),
+    _f("MAX_INTERRUPTIONS", "ai", "Restarts survived per build", "int", 3,
+       "A build whose worker was lost (restart, crash, reboot) runs again without using an attempt, up to "
+       "this many times.", min=0, max=20),
+    _f("CLAUDE_EARLY_HOLD_PERCENT", "ai", "Pause an AI account at plan usage (%)", "int", 95,
+       "Claude and Codex report their 5-hour and weekly plan usage with every run; at this share LAIka stops "
+       "sending that account work until the window resets, instead of waiting for a hard limit. Each account "
+       "can have its own \"Stop at\" (Settings → AI → More accounts).", apply="restart", min=50, max=100),
     _f("MAX_REVIEW_RECOVERIES", "ai", "Review retries before asking you", "int", 2, min=0, max=10),
     _f("BEST_OF_FROM_ATTEMPT", "ai", "Build twice from attempt", "int", 2,
        "A retried build is made twice in parallel and the smaller passing change wins. 0 = never.", min=0, max=10),

@@ -18,6 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import laika_env  # noqa: E402,F401  (Settings → environment, before any configuration is read)
 import agent_cli  # noqa: E402  (services/agent_cli.py)
 import network_access  # noqa: E402  (services/network_access.py)
+import provider_health  # noqa: E402  (services/provider_health.py)
+import provider_accounts  # noqa: E402  (services/provider_accounts.py)
+import job_events  # noqa: E402  (services/job_events.py)
 import laika_projects  # noqa: E402  (services/laika_projects.py)
 import project_sandbox  # noqa: E402  (services/project_sandbox.py)
 import laika_redis  # noqa: E402  (services/laika_redis.py)
@@ -69,7 +72,8 @@ MAX_REVIEW_RECOVERIES = int(os.getenv("MAX_REVIEW_RECOVERIES", "2"))
 # (across loop passes) before it is declared lost.
 LOST_CONFIRM_SECONDS = int(os.getenv("LOST_JOB_CONFIRM_SECONDS", "60"))
 
-r = redis.Redis.from_url(REDIS_URL, password=laika_redis.password(), decode_responses=True)
+r = job_events.JobEventRedis(redis.Redis.from_url(REDIS_URL, password=laika_redis.password(), decode_responses=True),
+                             "orchestrator")
 
 
 # --- one light read of all jobs per pass -------------------------------------------
@@ -311,7 +315,8 @@ Return ONLY valid JSON using this exact shape:
       "task": "complete implementation instructions",
       "scope": ["exact/file/it/will/change.py"],
       "size": "S|M",
-      "depends_on": []
+      "depends_on": [],
+      "acceptance": ["1-5 short, checkable statements of what is true when this job is done"]
     }}
   ]
 }}
@@ -467,32 +472,47 @@ def run_planner(goal, atomic=False, info=None, project=None):
     filled with the provider/model that produced the plan."""
     info = {} if info is None else info
     project = project or laika_projects.load(r, laika_projects.BUILTIN_PROJECT)
-    if agent_cli.role_provider("planner") == "claude" and not agent_cli.claude_cooling_down(r):
+    tried = set()
+    while agent_cli.role_provider("planner") == "claude" and not agent_cli.claude_cooling_down(r):
         log_path = PLANNER_LOG_ROOT / f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}.json"
         slot = f"planner:{log_path.stem}"
-        if not agent_cli.wait_for_claude_slot(
-                r, slot, plan_timeout(goal) + 60, int(os.getenv("PLANNER_SLOT_WAIT_SECONDS", "300"))):
-            info["fallback"] = "claude at capacity (CLAUDE_MAX_CONCURRENT)"
-            info.update(provider="codex", model=DEFAULT_MODEL)
-            return run_codex_planner(goal, atomic, project)
+        account = agent_cli.wait_for_claude_slot(
+            r, slot, plan_timeout(goal) + 60, int(os.getenv("PLANNER_SLOT_WAIT_SECONDS", "300")))
+        if not account or account in tried:
+            agent_cli.release_claude_slot(r, slot, account)
+            info["fallback"] = info.get("fallback") or "claude at capacity (every account's concurrent runs in use)"
+            break
         try:
             run = agent_cli.run_claude(
                 "planner", planner_prompt(goal, atomic=atomic, project=project),
                 project.repo, log_path, plan_timeout(goal), model=planner_model(atomic),
-                wrap=lambda argv: project_sandbox.command(argv, project, project.repo, kind="agent", writable=False))
+                wrap=lambda argv: project_sandbox.command(argv, project, project.repo, kind="agent", writable=False),
+                account=account)
         finally:
-            agent_cli.release_claude_slot(r, slot)
+            agent_cli.release_claude_slot(r, slot, account)
+        try:
+            agent_cli.record_rate_limits(r, log_path, account=account)
+        except Exception as exc:
+            print(f"[{ORCHESTRATOR_ID}] claude usage reading: {exc}", flush=True)
         if run.ok:
-            info.update(provider="claude", model=planner_model(atomic),
+            info.update(provider="claude", model=planner_model(atomic), provider_account=account,
                         cost_usd=agent_cli.claude_usage(run.result)["cost_usd"])
             return extract_json(run.text)
         if not run.unavailable:
             raise RuntimeError(f"claude planner failed: {run.describe_error()}")
-        agent_cli.start_cooldown(r, f"claude unavailable: {run.describe_error()}")
-        print(f"[{ORCHESTRATOR_ID}] claude planner unavailable; falling back to codex", flush=True)
+        agent_cli.start_cooldown(r, f"claude unavailable: {run.describe_error()}", failure=run.failure,
+                                 account=account)
+        tried.add(account)
+        print(f"[{ORCHESTRATOR_ID}] claude planner unavailable on account {account}; trying another", flush=True)
         info["fallback"] = run.describe_error()
     info.update(provider="codex", model=DEFAULT_MODEL)
     return run_codex_planner(goal, atomic, project)
+
+
+# Same as the worker's: no plugins/apps/hooks, no browser or computer control.
+CODEX_ISOLATION = tuple(arg for feature in (
+    "plugins", "apps", "hooks", "browser_use", "computer_use", "image_generation", "remote_plugin",
+    "skill_mcp_dependency_install") for arg in ("--disable", feature))
 
 
 def run_codex_planner(goal, atomic=False, project=None):
@@ -504,24 +524,42 @@ def run_codex_planner(goal, atomic=False, project=None):
         DEFAULT_MODEL,
         "--sandbox",
         "read-only",
-        "--ephemeral",
+        # Not --ephemeral: see agent_cli.record_codex_limits.
         "--color",
         "never",
         "--json",
+        *CODEX_ISOLATION,
         "--cd",
         str(project.repo),
         "-",
     ]
 
-    cmd = project_sandbox.codex_command(cmd, project, project.repo, writable=False)
-    proc = subprocess.run(
-        cmd,
-        input=planner_prompt(goal, atomic=atomic, project=project),
-        text=True,
-        capture_output=True,
-        timeout=plan_timeout(goal),
-        env={**os.environ, "HOME": os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir},
-    )
+    # Codex accounts (provider_accounts): the one with the most room left.
+    holder = f"planner:{uuid.uuid4().hex[:8]}"
+    account = provider_accounts.acquire(r, "codex", holder, plan_timeout(goal) + 60)
+    if not account:
+        # Every account paused or busy: the default one tries, unless it is turned off.
+        default = next(a for a in provider_accounts.accounts(r, "codex") if a["id"] == provider_accounts.DEFAULT)
+        if not default["enabled"]:
+            raise RuntimeError("planner failed: no Codex account can plan now (all paused, busy or turned off)")
+        account = provider_accounts.DEFAULT
+    env = agent_cli.agent_env()
+    env = provider_accounts.apply_env(env, provider_accounts.env_for("codex", account, base=env["HOME"]))
+    state = () if account == provider_accounts.DEFAULT else (provider_accounts.codex_home(account, env["HOME"]),)
+    cmd = project_sandbox.codex_command(cmd, project, project.repo, writable=False, state=state)
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=planner_prompt(goal, atomic=atomic, project=project),
+            text=True,
+            capture_output=True,
+            timeout=plan_timeout(goal),
+            env=env,
+        )
+    finally:
+        provider_accounts.release(r, "codex", account, holder)
+    agent_cli.record_codex_limits(r, None, provider_accounts.codex_home(account, env["HOME"]), account=account,
+                                  text=proc.stdout)
 
     if proc.returncode != 0:
         raise RuntimeError(
@@ -569,10 +607,38 @@ def compress_scope(scope):
     return compressed
 
 
+JOB_KEYS = {"number", "title", "task", "scope", "size", "depends_on", "project", "acceptance"}
+# Spellings planners use for known fields: a misspelled depends_on used to
+# drop the dependency silently.
+JOB_KEY_ALIASES = {"dependencies": "depends_on", "depends": "depends_on", "depends-on": "depends_on",
+                   "dependsOn": "depends_on", "acceptance_criteria": "acceptance", "criteria": "acceptance",
+                   "acceptanceCriteria": "acceptance", "files": "scope"}
+MAX_CRITERIA = 8
+
+
+def normalize_job_keys(job, number, warnings):
+    """Map known misspellings onto LAIka's fields; drop anything else with a
+    warning recorded on the goal (plan_warnings), never silently."""
+    for alias, name in JOB_KEY_ALIASES.items():
+        if alias in job and name not in job:
+            job[name] = job.pop(alias)
+            warnings.append(f"job {number}: read {alias!r} as {name!r}")
+    for unknown in sorted(set(job) - JOB_KEYS):
+        job.pop(unknown)
+        warnings.append(f"job {number}: ignored unknown field {unknown!r}")
+    criteria = job.get("acceptance", [])
+    if isinstance(criteria, str):
+        criteria = [criteria]
+    if not isinstance(criteria, list):
+        raise ValueError(f"job {number} acceptance must be a list of statements")
+    job["acceptance"] = [str(c).strip()[:300] for c in criteria if str(c).strip()][:MAX_CRITERIA]
+
+
 def validate_plan(plan, atomic=False, members=None):
     """members: the project ids a group goal may plan in (first = default)."""
     if not isinstance(plan, dict):
         raise ValueError("plan must be an object")
+    warnings = plan.setdefault("warnings", [])
 
     jobs = plan.get("jobs")
 
@@ -597,6 +663,8 @@ def validate_plan(plan, atomic=False, members=None):
             raise ValueError("duplicate job number")
 
         numbers.add(number)
+
+        normalize_job_keys(job, number, warnings)
 
         if not str(job.get("title", "")).strip():
             raise ValueError(f"job {number} has no title")
@@ -783,7 +851,16 @@ Efficiency requirements:
 - Make the smallest correct change.
 - Run only focused validation; LAIka runs the deterministic integration gate.
 - Stop when the requested implementation and focused validation are complete.
-""".strip() + goal_section(goal, jobs_in_plan)
+""".strip() + acceptance_section(item.get("acceptance")) + goal_section(goal, jobs_in_plan)
+
+
+def acceptance_section(criteria):
+    """The job's acceptance criteria for the builder (the reviewer checks each)."""
+    criteria = [c for c in (criteria or []) if str(c).strip()]
+    if not criteria:
+        return ""
+    lines = "\n".join(f"{n}. {c}" for n, c in enumerate(criteria, 1))
+    return f"\n\nDone when (the independent reviewer checks each one):\n{lines}"
 
 PLANNING_NOW = set()  # goal ids this process is planning right now
 MAX_PLAN_RESTARTS = 2
@@ -890,7 +967,7 @@ def _process_goal(raw, data, goal_id):
     for item in jobs:
         number_to_id[item["number"]] = uuid.uuid4().hex[:8]
 
-    job_ids = []
+    job_ids, records, payloads = [], [], {}
 
     for item in jobs:
         job_id = number_to_id[item["number"]]
@@ -900,12 +977,12 @@ def _process_goal(raw, data, goal_id):
             number_to_id[n]
             for n in item.get("depends_on", [])
         ]
-
+        prompt = scoped_builder_prompt(item, target.repo, goal, len(jobs))
         record = {
             "id": job_id,
             "goal_id": goal_id,
             "title": item["title"],
-            "prompt": scoped_builder_prompt(item, target.repo, goal, len(jobs)),
+            "prompt": prompt,
             "provider": DEFAULT_PROVIDER,
             "model": DEFAULT_MODEL,
             "role": "builder",
@@ -915,49 +992,54 @@ def _process_goal(raw, data, goal_id):
             "build_attempt": "1",
             "created_at": now(),
             "updated_at": now(),
-            "prompt_chars": str(len(scoped_builder_prompt(item, target.repo, goal, len(jobs)))),
+            "prompt_chars": str(len(prompt)),
             "project_id": target.id,
             "scope": json.dumps(item.get("scope", [])),
             "size": item.get("size", "M"),
+            "acceptance": json.dumps(item.get("acceptance", [])),
         }
 
-        # Files another in-flight job is changing: wait instead of building
-        # into a guaranteed integration conflict (release_dependencies()
-        # dispatches it once the files are free).
-        holder = None if dependencies else scope_conflict(record)
+        # Files another in-flight job is changing (including an earlier job
+        # of this plan): wait instead of building into a guaranteed
+        # integration conflict (release_dependencies() dispatches it later).
+        holder = None if dependencies else (scope_conflict(record) or plan_scope_conflict(record, records))
         if holder:
             record["status"] = "blocked"
             record["blocked_reason"] = holder[1]
-
-        r.hset(f"laika:jobs:{job_id}", mapping=record)
-
+        records.append(record)
         if not dependencies and not holder:
-            dispatch_job_once(record, {
-                    "id": job_id,
-                    "goal_id": goal_id,
-                    "prompt": scoped_builder_prompt(item, target.repo, goal, len(jobs)),
-                    "project_id": target.id,
-                    "provider": DEFAULT_PROVIDER,
-                    "model": DEFAULT_MODEL,
-                    "role": "builder",
-                    "priority": 0,
-                    "created_at": record["created_at"],
-                })
-
+            payloads[job_id] = {
+                "id": job_id,
+                "goal_id": goal_id,
+                "prompt": prompt,
+                "project_id": target.id,
+                "provider": DEFAULT_PROVIDER,
+                "model": DEFAULT_MODEL,
+                "role": "builder",
+                "priority": 0,
+                "created_at": record["created_at"],
+            }
         job_ids.append(job_id)
 
-    r.hset(
-        key,
-        mapping={
-            "status": "running",
-            "plan": json.dumps(plan),
-            "jobs": json.dumps(job_ids),
-            "planner_provider": planner.get("provider", ""),
-            "planner_model": planner.get("model", ""),
-            "planner_cost_usd": planner.get("cost_usd", ""),
-            "updated_at": now(),
-        },
-    )
+    # Every job and the goal's own record in one transaction: a crash can
+    # no longer leave a half-made plan behind that a re-plan then
+    # duplicates. Queueing comes after; a ready job whose queue entry was
+    # lost to a crash here is picked up by recover_lost_jobs.
+    goal_fields = {
+        "status": "running",
+        "plan": json.dumps(plan),
+        "jobs": json.dumps(job_ids),
+        "planner_provider": planner.get("provider", ""),
+        "planner_model": planner.get("model", ""),
+        "planner_account": planner.get("provider_account", ""),
+        "planner_cost_usd": planner.get("cost_usd", ""),
+        "plan_warnings": json.dumps(plan.get("warnings", [])[:20]),
+        "updated_at": now(),
+    }
+    write_plan(key, records, goal_fields)
+    for record in records:
+        if record["id"] in payloads:
+            dispatch_job_once(record, payloads[record["id"]])
 
     print(
         f"[{ORCHESTRATOR_ID}] goal={goal_id} planned "
@@ -966,6 +1048,35 @@ def _process_goal(raw, data, goal_id):
     )
     r.delete(claim_key)
 
+
+
+def plan_scope_conflict(record, earlier):
+    """(holder id, reason) if an earlier, ready job of the same plan already
+    claims one of record's files, else None."""
+    mine = job_scope(record)
+    for other in earlier:
+        if other.get("status") != "queued" or other.get("project_id") != record.get("project_id"):
+            continue
+        shared = sorted({a for a in mine for b in job_scope(other) if paths_overlap(a, b)})
+        if shared:
+            return other["id"], (f"waiting for {', '.join(shared[:4])}{' …' if len(shared) > 4 else ''} "
+                                 f"held by job {other['id']} (queued)")
+    return None
+
+
+def write_plan(goal_key, records, goal_fields):
+    """All job records plus the goal's plan fields in one MULTI/EXEC (plain
+    writes on clients without transactions, e.g. the tests' in-memory Redis)."""
+    try:
+        pipe = r.pipeline(transaction=True)
+    except AttributeError:
+        pipe = None
+    target = pipe if pipe is not None else r
+    for record in records:
+        target.hset(f"laika:jobs:{record['id']}", mapping=record)
+    target.hset(goal_key, mapping=goal_fields)
+    if pipe is not None:
+        pipe.execute()
 
 
 def review_findings(review):
@@ -1030,6 +1141,10 @@ def queue_repairs():
                 "testing",
             }:
                 continue
+
+        if builder.get("repair_status") == "waiting" and provider_health.held(
+                r, builder.get("repair_wait_provider") or "codex"):
+            continue  # the last repair could not run: no provider can serve it yet
 
         if builder.get("network_request") == "pending":
             # The last repair's tests failed for lack of internet access:
@@ -1462,6 +1577,24 @@ def recover_lost_jobs(now_ts=None):
             continue
         if not confirmed_lost(f"job:{job_id}", seen, now_ts):
             continue
+        # Take the job away from the lost run: if its worker wakes up, its
+        # writes no longer match (services/worker FencedRedis).
+        r.hset(key, "execution_id", f"revoked:{uuid.uuid4().hex[:12]}")
+        interruptions = _int(job.get("interruptions"))
+        if (is_builder(job) and job.get("build_attempt") and job.get("status") in INTERRUPTIBLE_STATES
+                and interruptions < MAX_INTERRUPTIONS):
+            # A restart, crash or reboot is not the build's fault: run the
+            # same attempt again instead of using one up (resume_deferred_jobs).
+            r.hset(key, mapping={
+                "status": "deferred",
+                "defer_kind": "interrupted",
+                "defer_reason": f"worker lost while {job.get('status')} (last worker {job.get('worker_id') or 'none'})",
+                "interruptions": str(interruptions + 1),
+                "lost_at": now(),
+                "updated_at": now(),
+            })
+            print(f"[{ORCHESTRATOR_ID}] lost job={job_id} deferred (interruption {interruptions + 1})", flush=True)
+            continue
         r.hset(key, mapping={
             "status": "failed",
             "error": (
@@ -1475,6 +1608,65 @@ def recover_lost_jobs(now_ts=None):
         print(f"[{ORCHESTRATOR_ID}] lost job={job_id} marked failed", flush=True)
     for suspect in [s for s in _lost_suspects if s.startswith("job:") and s not in seen]:
         del _lost_suspects[suspect]
+
+
+# A worker lost mid-build (restart, crash, reboot) and a provider that could
+# not serve the build (quota, rate limit, sign-in, outage) re-run the same
+# attempt instead of using one up, a bounded number of times; then the
+# normal failure path (retry, then needs_human) takes over.
+INTERRUPTIBLE_STATES = {"queued", "claimed", "running", "testing"}
+MAX_INTERRUPTIONS = int(os.getenv("MAX_INTERRUPTIONS", "3"))
+MAX_PROVIDER_DEFERRALS = int(os.getenv("MAX_PROVIDER_DEFERRALS", "6"))
+# Moves to another account of the same provider (several accounts): each is
+# immediate and uses no wait, but they are bounded too.
+MAX_ACCOUNT_SWITCHES = 12
+
+
+def resume_deferred_jobs(now_ts=None):
+    """Re-queue deferred builders (same attempt, same prompt) once what they
+    wait for is back: at once for an interruption, when the provider's hold
+    has ended for a provider wait."""
+    now_ts = time.time() if now_ts is None else now_ts
+    for key, light in job_rows():
+        if light.get("status") != "deferred" or not is_builder(light):
+            continue
+        job = r.hgetall(key)
+        if job.get("status") != "deferred":
+            continue
+        job_id = job.get("id") or key.rsplit(":", 1)[-1]
+        deferrals = _int(job.get("deferrals"))
+        if job.get("defer_kind") == "provider":
+            if deferrals > MAX_PROVIDER_DEFERRALS or _int(job.get("account_switches")) > MAX_ACCOUNT_SWITCHES:
+                r.hset(key, mapping={
+                    "status": "failed",
+                    "error": f"waited for {job.get('defer_provider') or 'a provider'} {deferrals} times: "
+                             f"{job.get('defer_reason', '')}"[:1000],
+                    "updated_at": now(),
+                })
+                print(f"[{ORCHESTRATOR_ID}] job={job_id} stopped waiting after {deferrals} provider waits", flush=True)
+                continue
+            provider = job.get("defer_provider") or "codex"
+            if provider_health.held(r, provider):
+                continue
+        round_id = (f"{job.get('defer_kind') or 'deferred'}_{job.get('interruptions') or 0}_{deferrals}"
+                    f"_{job.get('account_switches') or 0}")
+        if not r.hsetnx(key, f"resume_{round_id}_at", now()):
+            continue
+        release_stale_integration_lock(job_id)
+        # The counters stay (they bound the waits); what it waited for goes.
+        r.hdel(key, *BUILD_DERIVED_FIELDS, "defer_until", "defer_kind", "defer_provider", "defer_reason")
+        r.hset(key, mapping={"status": "queued", "updated_at": now()})
+        dispatch_job_once({"id": job_id}, {
+            "id": job_id,
+            "goal_id": job.get("goal_id", ""),
+            "prompt": job.get("prompt", ""),
+            "provider": job.get("provider", DEFAULT_PROVIDER),
+            "model": job.get("model", DEFAULT_MODEL),
+            "role": "builder",
+            "priority": _int(job.get("priority")),
+            "created_at": job.get("created_at", now()),
+        })
+        print(f"[{ORCHESTRATOR_ID}] job={job_id} resumed after {job.get('defer_kind')}", flush=True)
 
 
 def retry_failed_builds():
@@ -1646,6 +1838,18 @@ def recover_stalled_reviews(now_ts=None):
         } - {None, ""}
         if related & busy:
             continue
+        waiting_for = builder.get("review_wait_provider")
+        if waiting_for and builder.get("review_status") == "failed":
+            # No provider could review it: retry once one can, without using
+            # a review recovery (worker provider_wait_fields bounds the waits).
+            if provider_health.held(r, waiting_for):
+                continue
+            waits = builder.get("review_waits") or "1"
+            if r.hsetnx(key, f"review_wait_{waits}_resumed_at", now()):
+                integrate_id = queue_reintegration(key, builder, {"review_wait_provider": ""})
+                print(f"[{ORCHESTRATOR_ID}] review of builder={builder_id} resumes after waiting for "
+                      f"{waiting_for} via {integrate_id}", flush=True)
+            continue
         if not confirmed_lost(f"stall:{builder_id}", seen, now_ts):
             continue
         del _lost_suspects[f"stall:{builder_id}"]
@@ -1678,7 +1882,7 @@ def recover_stalled_reviews(now_ts=None):
 # A builder holds its scope from dispatch until its change is final: an
 # awaiting_review / needs_human candidate still has to integrate onto main.
 SCOPE_HOLDING_STATES = {
-    "queued", "claimed", "running", "testing", "awaiting_review", "needs_human",
+    "queued", "claimed", "running", "testing", "awaiting_review", "needs_human", "deferred",
 }
 
 
@@ -1732,7 +1936,7 @@ def scope_conflict(job):
 
 SIZE_POINTS = {"S": 1, "M": 3, "L": 8}
 UNPLANNED_GOAL_POINTS = SIZE_POINTS["M"]
-REMAINING_STATES = {"queued", "blocked", "claimed", "running", "testing", "awaiting_review"}
+REMAINING_STATES = {"queued", "blocked", "claimed", "running", "testing", "awaiting_review", "deferred"}
 FINAL_GOAL_STATES = {"completed", "failed", "planning_failed", "queue_failed"}
 
 
@@ -1875,7 +2079,19 @@ def process_goal_safe(raw):
         raise
 
 
+PAUSE_KEY = "laika:pause"
+
+
+def paused():
+    try:
+        return bool(r.get(PAUSE_KEY))
+    except Exception:  # a client without strings (tests) or a Redis hiccup: not paused
+        return False
+
+
 def submit_queued_goals(executor, futures):
+    if paused():
+        return  # all new work paused by the operator: goals wait in their queue
     while len(futures) < MAX_CONCURRENT_GOALS:
         raw = r.lpop(GOAL_QUEUE)
         if not raw:
@@ -1904,6 +2120,7 @@ def main():
 
                 begin_pass()
                 recover_lost_jobs()
+                resume_deferred_jobs()
                 retry_failed_builds()
                 recover_stalled_reviews()
                 refresh_queued_candidates()

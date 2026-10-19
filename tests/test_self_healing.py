@@ -311,19 +311,33 @@ def test_review_recoveries_are_bounded(orch):
 
 # --- end to end: a worker dies mid-build ---------------------------------------------
 
-def test_worker_death_mid_build_leads_to_a_rebuild(orch):
+def test_worker_death_mid_build_reruns_the_same_attempt(orch):
+    # A restart, crash or reboot is not the build's fault: the same attempt
+    # runs again with the same prompt (no "attempt 1 failed" note), a bounded
+    # number of times.
     worker(orch, "w1")  # restarted: idle, holds nothing
     put(orch, "b1", role="builder", status="running", worker_id="w1",
         build_attempt="1", prompt="Add a thing", goal_id="g1")
     put(orch, "d1", role="builder", status="blocked", dependencies='["b1"]', prompt="p")
     for t in (T0, T0 + orch.LOST_CONFIRM_SECONDS):
         orch.recover_lost_jobs(t)
+        orch.resume_deferred_jobs()
         orch.retry_failed_builds()
         orch.release_dependencies()
     assert job(orch, "b1")["status"] == "queued"
-    assert "worker lost" in job(orch, "b1")["prompt"]
+    assert job(orch, "b1")["build_attempt"] == "1" and job(orch, "b1")["prompt"] == "Add a thing"
+    assert job(orch, "b1")["interruptions"] == "1"
     assert queued_ids(orch) == ["b1"]
     assert job(orch, "d1")["status"] == "blocked"
+
+
+def test_repeated_interruptions_fall_back_to_a_normal_failure(orch):
+    worker(orch, "w1")
+    put(orch, "b2", role="builder", status="running", worker_id="w1", build_attempt="1", prompt="x",
+        goal_id="g1", interruptions=str(orch.MAX_INTERRUPTIONS))
+    for t in (T0, T0 + orch.LOST_CONFIRM_SECONDS):
+        orch.recover_lost_jobs(t)
+    assert job(orch, "b2")["status"] == "failed" and "worker lost" in job(orch, "b2")["error"]
 
 
 # --- worker side ------------------------------------------------------------------------
@@ -338,6 +352,8 @@ class WorkerGit:
 
     def __call__(self, *args, cwd=None, check=True):
         self.calls.append(args)
+        if args in (("rev-parse", "--git-common-dir"), ("rev-parse", "--git-dir")):
+            return GitResult(".git\n")   # guard_git_control: nothing there to compare
         if args == ("rev-parse", "HEAD"):
             return GitResult(self.head + "\n")
         if args == ("status", "--porcelain"):
@@ -441,7 +457,7 @@ def repair_setup(worker_module, tmp_path):
 def test_repair_starts_from_clean_candidate_after_an_earlier_failure(worker_module, tmp_path):
     job, key, log, test_log = repair_setup(worker_module, tmp_path)
     worker_module.git_fake.dirty = True  # left by a failed repair
-    worker_module.run_codex = lambda *a: (_ for _ in ()).throw(RuntimeError("stop here"))
+    worker_module.run_codex = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stop here"))
     with pytest.raises(RuntimeError, match="stop here"):
         worker_module.process_repair_job(job, key, log, test_log)
     resets = [c for c in worker_module.git_fake.calls if c[0] == "reset"]
@@ -452,7 +468,7 @@ def test_repair_starts_from_clean_candidate_after_an_earlier_failure(worker_modu
 def test_repair_timeout_restores_candidate_and_propagates(worker_module, tmp_path):
     job, key, log, test_log = repair_setup(worker_module, tmp_path)
 
-    def codex(*args):
+    def codex(*args, **kwargs):
         worker_module.git_fake.dirty = True
         raise RuntimeError("Codex exceeded 360 second repair timeout")
 
@@ -465,7 +481,7 @@ def test_repair_timeout_restores_candidate_and_propagates(worker_module, tmp_pat
 def test_repair_gate_failure_restores_candidate(worker_module, tmp_path):
     job, key, log, test_log = repair_setup(worker_module, tmp_path)
 
-    def codex(*args):
+    def codex(*args, **kwargs):
         worker_module.git_fake.dirty = True
         return 0, 1.0
 

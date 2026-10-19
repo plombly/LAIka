@@ -235,7 +235,7 @@ def worker(tmp_path, fake_claude, monkeypatch):
     module.agent_cli.POLL_SECONDS = 0.05
     module.codex_calls = []
 
-    def fake_codex(job, worktree, log_path):
+    def fake_codex(job, worktree, log_path, account=None):
         module.codex_calls.append(job["id"])
         Path(log_path).write_text(json.dumps(
             {"type": "item.completed", "item": {"type": "agent_message", "text": "codex says hi"}}))
@@ -383,7 +383,7 @@ def test_orchestrator_heartbeat_and_goal_record_the_planner(orch, fake_claude, m
     monkeypatch.setenv("FAKE_CLAUDE_RESULT", '{"jobs": []}')
     info = {}
     orch.run_planner("goal", info=info)
-    assert info == {"provider": "claude", "model": "opus", "cost_usd": "0.0421"}
+    assert info == {"provider": "claude", "model": "opus", "provider_account": "default", "cost_usd": "0.0421"}
     monkeypatch.setenv("FAKE_CLAUDE_MODE", "limit")
     orch.run_codex_planner = lambda goal, atomic=False, project=None: {"jobs": []}
     info = {}
@@ -404,7 +404,6 @@ def test_slots_are_capped_leased_and_released(agent_cli, monkeypatch):
     assert agent_cli.acquire_claude_slot(fake, "c", 100, now=1000)
     # b's lease expires (its worker died): the slot comes back by itself
     assert agent_cli.acquire_claude_slot(fake, "d", 100, now=1101)
-    assert fake.get(agent_cli.SLOT_LIMIT_KEY) == "2"
 
 
 def test_wait_for_slot_gives_up_after_max_wait(agent_cli, monkeypatch):
@@ -674,17 +673,17 @@ def test_half_installed_cli_is_unavailable(agent_cli, tmp_path, monkeypatch):
     assert run.unavailable and "postinstall" in run.describe_error()
 
 
-def test_plan_limit_still_gets_the_long_cooldown(agent_cli):
-    seen = {}
-
-    class R:
-        def set(self, key, value, ex=None):
-            seen["ex"] = ex
-
-    agent_cli.start_cooldown(R(), "claude unavailable: success: You've hit your session limit")
-    assert seen["ex"] == agent_cli.COOLDOWN_SECONDS
-    agent_cli.start_cooldown(R(), "claude unavailable: [Errno 2] No such file or directory: 'claude'")
-    assert seen["ex"] == agent_cli.INSTALL_COOLDOWN_SECONDS
+def test_plan_limit_holds_until_its_reset_and_an_update_only_briefly(agent_cli):
+    import provider_health
+    fake = MemoryRedis()
+    agent_cli.start_cooldown(fake, "claude unavailable: success: You've hit your session limit")
+    assert fake.ttls[agent_cli.COOLDOWN_KEY] == provider_health.DEFAULT_SECONDS["quota"]   # no reset time given
+    fake = MemoryRedis()
+    agent_cli.start_cooldown(fake, "claude unavailable: success: You've hit your session limit · resets in 2h 30m")
+    assert abs(fake.ttls[agent_cli.COOLDOWN_KEY] - (9000 + provider_health.MARGIN)) <= 2
+    fake = MemoryRedis()
+    agent_cli.start_cooldown(fake, "claude unavailable: [Errno 2] No such file or directory: 'claude'")
+    assert fake.ttls[agent_cli.COOLDOWN_KEY] == agent_cli.INSTALL_COOLDOWN_SECONDS
 
 
 def test_crash_with_unrelated_output_is_still_a_failure(agent_cli, fake_claude, tmp_path, monkeypatch):
@@ -699,3 +698,31 @@ def test_planner_falls_back_when_claude_is_mid_update(orch, tmp_path, monkeypatc
     info = {}
     assert orch.run_planner("g", info=info) == {"jobs": ["codex"]}
     assert info["provider"] == "codex" and "No such file" in info["fallback"]
+
+
+def test_kill_group_never_signals_group_one_or_our_own(agent_cli, monkeypatch):
+    # A fake process with pid 1 in a test once made the cleanup SIGKILL every
+    # service on the host (os.killpg(1, SIGKILL) as root).
+    sent = []
+    monkeypatch.setattr(agent_cli.os, "killpg", lambda pid, sig: sent.append((pid, sig)))
+    for bad in (0, 1, -1, None, True, "123", agent_cli.os.getpgrp()):
+        assert agent_cli.kill_group(bad, 9) is False
+    assert sent == []
+    monkeypatch.setattr(agent_cli.os, "getpgid", lambda pid: 4242)      # a live process in someone else's group
+    assert agent_cli.kill_group(5000, 9) is False and sent == []
+    monkeypatch.setattr(agent_cli.os, "getpgid", lambda pid: pid)       # our child, leading its own group
+    assert agent_cli.kill_group(5000, 9) is True and sent == [(5000, 9)]
+
+
+def test_worker_cleanup_with_a_fake_pid_one_signals_nothing(monkeypatch):
+    worker = load_module(ROOT / "services/worker/worker.py", "worker_kill_safety")
+    sent = []
+    monkeypatch.setattr(worker.agent_cli.os, "killpg", lambda pid, sig: sent.append((pid, sig)))
+
+    class Fake:
+        pid = 1
+        def wait(self, timeout=None):
+            return 0
+    worker.kill_leftovers(Fake())
+    worker.stop_process_group(Fake())
+    assert sent == []

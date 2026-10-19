@@ -284,3 +284,53 @@ def test_release_inside_a_pass_still_holds_files_one_at_a_time(orch):
     orch.release_dependencies()   # the pass read still says "blocked" for early when late is checked
     orch.end_pass()
     assert queued(orch) == ["early"] and job(orch, "late")["status"] == "blocked"
+
+
+def test_two_jobs_of_one_plan_on_the_same_file_do_not_start_together(orch, monkeypatch):
+    orch.r.records["laika:goals:g5"] = {"id": "g5", "goal": "shop", "status": "queued"}
+    plan = {"jobs": [{"number": 1, "title": "cart", "task": "t", "size": "M", "scope": ["shop.py"], "depends_on": []},
+                     {"number": 2, "title": "checkout", "task": "t", "size": "M", "scope": ["shop.py"], "depends_on": []}]}
+    monkeypatch.setattr(orch, "run_planner", lambda goal, atomic=False, info=None, project=None: plan)
+    monkeypatch.setattr(orch, "repository_manifest", lambda repo=None: "")
+    orch.process_goal(json.dumps({"id": "g5", "goal": "shop"}))
+    jobs = {j["title"]: j for k, j in orch.r.records.items() if k.startswith("laika:jobs:") and j.get("goal_id") == "g5"}
+    assert jobs["cart"]["status"] == "queued" and jobs["checkout"]["status"] == "blocked"
+    assert "held by job" in jobs["checkout"]["blocked_reason"]
+    goal = orch.r.records["laika:goals:g5"]
+    assert goal["status"] == "running" and sorted(json.loads(goal["jobs"])) == sorted(j["id"] for j in jobs.values())
+
+
+def test_acceptance_criteria_and_misspelled_fields(orch):
+    plan = {"jobs": [{"number": 1, "title": "a", "task": "t", "scope": ["a.py"], "acceptance_criteria": "it works"},
+                     {"number": 2, "title": "b", "task": "t", "scope": ["b.py"], "dependencies": [1],
+                      "acceptance": ["  x  ", ""], "notes": "free text"}]}
+    jobs = orch.validate_plan(plan)
+    assert jobs[0]["acceptance"] == ["it works"] and jobs[1]["depends_on"] == [1] and jobs[1]["acceptance"] == ["x"]
+    assert "notes" not in jobs[1]
+    assert "job 2: read 'dependencies' as 'depends_on'" in plan["warnings"]
+    assert "job 2: ignored unknown field 'notes'" in plan["warnings"]
+    prompt = orch.scoped_builder_prompt({"task": "t", "scope": [], "acceptance": ["GET /x works"]})
+    assert "Done when (the independent reviewer checks each one):\n1. GET /x works" in prompt
+
+
+def test_reviewer_lines_become_a_checklist():
+    worker = load_module(ROOT / "services/worker/worker.py", "worker_criteria_test")
+    messages = ["Findings...\nCRITERION 1: MET - app.py adds /ping\n**CRITERION 2**: NOT MET - no test\nVERDICT: CHANGES_REQUIRED"]
+    review = worker.parse_criteria_review(messages, ["/ping exists", "a test covers it", "docs updated"])
+    assert [(r["met"], r["note"]) for r in review] == [(True, "app.py adds /ping"), (False, "no test"), (None, "")]
+    assert "CRITERION <number>: MET" in worker.criteria_review_note(["x"]) and worker.criteria_review_note([]) == ""
+
+
+def test_no_goal_is_planned_while_all_new_work_is_paused(orch):
+    orch.r.values["laika:pause"] = '{"by": "admin"}'
+    orch.r.values[orch.GOAL_QUEUE] = ['{"id": "g1", "goal": "x"}']
+    submitted = []
+    executor = type("E", (), {"submit": lambda self, fn, raw: submitted.append(raw)})()
+    orch.submit_queued_goals(executor, set())
+    assert submitted == [] and orch.r.values[orch.GOAL_QUEUE] == ['{"id": "g1", "goal": "x"}']
+
+
+def test_one_not_met_from_any_specialist_review_wins():
+    worker = load_module(ROOT / "services/worker/worker.py", "worker_criteria_merge_test")
+    messages = ["## spec review\nCRITERION 1: MET - fine\n## safety review\nCRITERION 1: NOT MET - leaks a token\nCRITERION 1: MET - ok"]
+    assert worker.parse_criteria_review(messages, ["x"]) == [{"criterion": "x", "met": False, "note": "leaks a token"}]

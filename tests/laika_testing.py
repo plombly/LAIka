@@ -84,7 +84,16 @@ class MemoryRedis:
         if nx and key in self.values:
             return False
         self.values[key] = value
+        if ex is not None:
+            self.ttls[key] = int(ex)
+        else:
+            self.ttls.pop(key, None)
         return True
+
+    def ttl(self, key):
+        if key not in self.values and key not in self.records:
+            return -2
+        return self.ttls.get(key, -1)
 
     def get(self, key):
         return self.values.get(key)
@@ -134,7 +143,7 @@ class MemoryRedis:
             zset = self.zsets.setdefault(key, {})
             for member in [m for m, score in zset.items() if score <= now]:
                 del zset[member]
-            if holder in zset or len(zset) < limit:
+            if holder in zset or limit <= 0 or len(zset) < limit:
                 zset[holder] = expiry
                 return 1
             return 0
@@ -143,6 +152,11 @@ class MemoryRedis:
             del self.values[key]
             return 1
         return 0
+
+    def zcount(self, key, low, high):
+        low = float("-inf") if low in ("-inf",) else float(low)
+        high = float("inf") if high in ("+inf", "inf") else float(high)
+        return sum(1 for score in self.zsets.get(key, {}).values() if low <= score <= high)
 
     def zrem(self, key, *members):
         zset = self.zsets.setdefault(key, {})
@@ -160,6 +174,10 @@ class MemoryRedis:
         entry_id = f"{ms}-{seq}"
         entries.append((entry_id, {str(k): str(v) for k, v in fields.items()}))
         return entry_id
+
+    def xrange(self, name, min="-", max="+", count=None):
+        entries = list(self.streams.get(name, []))
+        return entries[:count] if count else entries
 
     def xgroup_create(self, name, groupname, id="$", mkstream=False):
         if name not in self.streams:
@@ -217,6 +235,9 @@ class FakeGit:
         self.integrated_dirty = False
         self.branch_heads = {"laika/job-b1": "a" * 40}  # the builder branch
         self.failing = set()
+        self.index_flags = [("H", "file.py")]
+        self.raw_diff = ""        # git diff --raw -z of the candidate (candidate_safety)
+        self.blobs = {}
 
     def __call__(self, *args, cwd=None, check=True):
         cwd = Path(cwd if cwd is not None else self.module.REPO_ROOT)
@@ -234,9 +255,20 @@ class FakeGit:
         elif args[0] == "show-ref":
             ref = args[-1].removeprefix("refs/heads/")
             result = GitResult(returncode=0 if ref in self.branch_heads else 1)
-        elif args[:2] in {("merge", "--ff-only"), ("worktree", "remove"),
-                          ("branch", "-d"), ("branch", "-D")}:
+        elif args[:2] == ("merge", "--ff-only"):
+            target = args[2]
+            self.main_head = self.branch_heads.get(target, target)
             result = GitResult()
+        elif args[:2] in {("worktree", "remove"), ("branch", "-d"), ("branch", "-D")}:
+            result = GitResult()
+        elif args[:2] == ("ls-files", "-v"):
+            result = GitResult("".join(f"{flag} {name}\n" for flag, name in self.index_flags))
+        elif args[:2] == ("merge-base", "--is-ancestor"):
+            result = GitResult()
+        elif args[:2] == ("diff", "--raw"):
+            result = GitResult(self.raw_diff)
+        elif args[0] == "cat-file":
+            result = GitResult(self.blobs.get(args[-1], ""))
         else:
             raise AssertionError(f"unexpected git call: {args} cwd={cwd}")
         if check and result.returncode != 0:

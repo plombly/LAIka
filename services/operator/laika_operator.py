@@ -66,7 +66,8 @@ OUTPUT_LIMIT = 8000
 NETWORK_ACTIONS = ("network_once", "network_always", "network_deny")
 # Host helpers (scripts/laika-system.py, laika-providers.py), run as their own unit.
 SYSTEM_ACTIONS = ("apply_settings", "provider_login", "provider_status", "provider_apply_keys", "system_update",
-                  "remote_status", "remote_install", "remote_login", "remote_logout")
+                  "remote_status", "remote_install", "remote_login", "remote_logout", "backup_now",
+                  "restore_check_now")
 ACTIONS = ("approve", "queue_approve", "dequeue_approve", "reject", "extend", "reintegrate", "reopen", *NETWORK_ACTIONS,
            "create_project", "project_retry_clone", "project_push_setup", "delete_project",
            "project_commit_upload", "restore_project", "project_revert", *SYSTEM_ACTIONS)
@@ -386,9 +387,10 @@ def validate(fields, entry_id, now):
         what = fields.get("what", "")
         if action == "apply_settings" and what not in APPLY_WHAT:
             raise Invalid(f"what must be one of {', '.join(APPLY_WHAT)}")
-        if action == "provider_login" and what not in ("claude", "codex"):
-            raise Invalid("provider must be claude or codex")
-        if action in ("provider_status", "provider_apply_keys", "system_update") or action.startswith("remote_"):
+        if action == "provider_login" and not re.fullmatch(r"(claude|codex)(:[a-z0-9][a-z0-9-]{0,23})?", what):
+            raise Invalid("provider must be claude or codex (optionally :account)")
+        if action in ("provider_status", "provider_apply_keys", "system_update", "backup_now",
+                      "restore_check_now") or action.startswith("remote_"):
             what = ""
         return {"action": action, "what": what, "job_id": "", "project_id": ""}
     if action in PROJECT_ACTIONS:
@@ -467,7 +469,7 @@ def call_action(request):
 
 SYSTEM_COMMANDS = {
     "apply_settings": ("apply", "scripts/laika-system.py", lambda what: [what]),
-    "provider_login": ("signin", "scripts/laika-providers.py", lambda what: ["login", what]),
+    "provider_login": ("signin", "scripts/laika-providers.py", lambda what: ["login", *what.split(":", 1)]),
     "provider_status": ("providers", "scripts/laika-providers.py", lambda what: ["status"]),
     "provider_apply_keys": ("keys", "scripts/laika-providers.py", lambda what: ["apply-keys"]),
     "system_update": ("update", "scripts/laika-update.py", lambda what: ["apply", "--yes"]),
@@ -476,9 +478,12 @@ SYSTEM_COMMANDS = {
     "remote_install": ("remote", "scripts/laika-remote.py", lambda what: ["install"]),
     "remote_login": ("remote", "scripts/laika-remote.py", lambda what: ["login"]),
     "remote_logout": ("remote", "scripts/laika-remote.py", lambda what: ["logout"]),
+    # Settings -> System: a backup or a restore check now (the timers' own units).
+    "backup_now": ("backup", "scripts/laika-system.py", lambda what: ["backup-now"]),
+    "restore_check_now": ("restore", "scripts/laika-system.py", lambda what: ["restore-check-now"]),
 }
 ROOT_SYSTEM_ACTIONS = ("apply_settings", "system_update", "remote_status", "remote_install", "remote_login",
-                       "remote_logout")
+                       "remote_logout", "backup_now", "restore_check_now")
 
 
 def execute_system(request, runner=subprocess.run):
@@ -492,6 +497,9 @@ def execute_system(request, runner=subprocess.run):
     result = runner([os.environ.get("SYSTEMD_RUN", "systemd-run"), f"--unit={name}", "--collect", "--quiet",
                      "--property=EnvironmentFile=-/etc/laika/providers/providers.env",
                      "--property=EnvironmentFile=-/etc/laika/redis.env", *as_user,
+                     # Extra accounts' API keys reach only the step that puts them in place.
+                     *(["--property=EnvironmentFile=-/etc/laika/providers/accounts.env"]
+                       if request["action"] == "provider_apply_keys" else []),
                      f"--description=LAIka: {request['action']}", PYTHON,
                      str(ROOT / script), *args(request["what"])],
                     text=True, capture_output=True, timeout=60)

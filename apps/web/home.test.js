@@ -109,3 +109,25 @@ test('approved changes in the merge queue say so instead of offering Approve aga
   assert.doesNotMatch(html, /data-op="approve"/);
   assert.doesNotMatch(html, /data-approve-all/);
 });
+
+test('an approval card names sensitive files the change touches', async () => {
+  const { sensitiveMarkup } = await import('./lib/home.js');
+  assert.equal(sensitiveMarkup({ sensitive_paths: [] }), '');
+  assert.match(sensitiveMarkup({ sensitive_paths: ['conftest.py'] }), /Also changes a file that steers tests.*<code>conftest\.py<\/code>/);
+  assert.match(sensitiveMarkup({ sensitive_paths: ['a', 'b', 'c', 'd', 'e'] }), /5 files that steer tests.*…/);
+});
+
+test('an approval card shows the acceptance checklist with the reviewer verdicts', async () => {
+  const { criteriaMarkup } = await import('./lib/home.js');
+  const html = criteriaMarkup({ acceptance: ['GET /ping returns pong', 'a test covers it'], acceptance_review: [{ met: true, note: 'app.py:12' }, { met: null }] });
+  assert.match(html, /class="crit ok">✓<\/span> GET \/ping returns pong<div class="subtle">app\.py:12/);
+  assert.match(html, /class="crit unknown">\?<\/span> a test covers it/);
+  assert.equal(criteriaMarkup({}), '');
+});
+
+test('a goal with nothing running offers "Why?" for its first waiting job', () => {
+  const goals = [{ id: 'g1', status: 'running', summary: 'Shop', project_id: 'shop', progress: { total: 2, completed: 0 } }];
+  const html = inProgressMarkup({ goals, jobs: [{ id: 'j1', goal_id: 'g1', status: 'deferred' }] });
+  assert.match(html, /data-why="j1"/);
+  assert.doesNotMatch(inProgressMarkup({ goals, jobs: [{ id: 'j1', goal_id: 'g1', status: 'running', role: 'builder' }] }), /data-why=/);
+});

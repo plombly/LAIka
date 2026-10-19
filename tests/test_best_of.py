@@ -43,7 +43,7 @@ def builders(worker, primary=None, alt=None, primary_rc=0, alt_ok=True, new_file
             (worktree / "app.py").write_text(primary)
         return primary_rc, 1.0
 
-    def run_alternate(job, provider, worktree, log_path, timeout):
+    def run_alternate(job, provider, worktree, log_path, timeout, account=None):
         if alt is not None:
             (worktree / "app.py").write_text(alt)
         if new_file:
@@ -108,7 +108,7 @@ def test_skipped_when_claude_is_at_capacity(worker, monkeypatch):
     monkeypatch.setenv("BEST_OF_ALT_PROVIDER", "claude")  # opt-in only
     monkeypatch.setenv("CLAUDE_MAX_CONCURRENT", "1")
     worker.agent_cli.acquire_claude_slot(worker.redis, "job:busy", 1000)
-    worker.agent_cli.wait_for_claude_slot = lambda *a, **k: False
+    monkeypatch.setattr(worker.agent_cli, "wait_for_claude_slot", lambda *a, **k: None)
     calls = []
     worker.run_agent = lambda job, wt, log: calls.append(job["id"]) or (0, 1.0)
     _, worktree = worker.create_worktree("b1")
@@ -139,10 +139,39 @@ def test_default_second_build_is_codex_and_never_claude(repo, tmp_path, monkeypa
     module.run_tests = lambda wt, network=False: (True, "")
     module.run_agent = lambda job, wt, log: (0, 1.0)
     prompts = []
-    module.run_codex = lambda job, wt, log: prompts.append(job["prompt"]) or (0, 1.0)
-    module.agent_cli.run_claude = lambda *a, **k: pytest.fail("Claude must not build")
-    module.agent_cli.wait_for_claude_slot = lambda *a, **k: pytest.fail("no Claude slot needed")
+    module.run_codex = lambda job, wt, log, account=None: prompts.append(job["prompt"]) or (0, 1.0)
+    # monkeypatch: agent_cli is shared by every loaded worker module (other tests).
+    monkeypatch.setattr(module.agent_cli, "run_claude", lambda *a, **k: pytest.fail("Claude must not build"))
+    monkeypatch.setattr(module.agent_cli, "wait_for_claude_slot", lambda *a, **k: pytest.fail("no Claude slot needed"))
     _, worktree = module.create_worktree("b1")
     module.run_best_of({"id": "b1", "role": "builder", "prompt": "task"}, worktree, worktree.parent / "l")
     assert len(prompts) == 1 and "independent second attempt" in prompts[0]
     assert json.loads(module.redis.records["laika:jobs:b1"]["best_of"])["alt"]["provider"] == "codex"
+
+
+def test_a_provider_wait_in_the_main_build_stays_a_wait(worker):
+    import provider_health
+    builders(worker, alt="broken\n")
+
+    def waiting(job, worktree, log_path):
+        raise worker.ProviderWait("codex", provider_health.Failure("auth", "sign in again"))
+
+    worker.run_agent = waiting
+    with pytest.raises(worker.ProviderWait):
+        build(worker)
+
+
+def test_the_other_build_still_wins_when_the_main_one_waits(worker):
+    import provider_health
+    builders(worker, alt="OK\n")
+    worker.run_agent = lambda job, wt, log: (_ for _ in ()).throw(
+        worker.ProviderWait("codex", provider_health.Failure("quota", "limit")))
+    (rc, _), worktree, report = build(worker)
+    assert rc == 0 and report["chosen"] == "alt"
+
+
+def test_no_second_build_on_an_account_that_is_off_or_paused(worker, tmp_path):
+    import provider_health
+    worker.redis.records["laika:provider-account:codex:default"] = {"enabled": ""}
+    with pytest.raises(RuntimeError, match="no Codex account is free"):
+        worker.run_alternate_builder({"id": "b1", "prompt": "p"}, "codex", tmp_path, tmp_path / "l", 60)

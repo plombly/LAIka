@@ -331,6 +331,7 @@ def _job(key, data):
         "role": _text(data.get("job_role", data.get("role"))),
         "worker": _text(data.get("worker_id", data.get("worker"))),
         "provider": _text(data.get("provider")),
+        "provider_account": _text(data.get("provider_account")),
         "model": _text(data.get("model")),
         "review_status": _text(data.get("review_status")),
         "review_verdict": _text(data.get("review_verdict")),
@@ -369,6 +370,13 @@ def _job(key, data):
         "review_aspects": _json_object(data.get("review_aspects")),
         "merge_queue_state": _text(data.get("merge_queue_state")),
         "merge_queue_reason": _text(data.get("merge_queue_reason")),
+        # Files the safety check flagged (services/candidate_safety.py): shown on the approval card.
+        "sensitive_paths": [_text(p) for p in (_json_list(data.get("sensitive_paths")) or [])][:20],
+        "defer_reason": _text(data.get("defer_reason")),
+        # The planner's acceptance criteria and the reviewer's verdict on each.
+        "acceptance": [_text(c) for c in (_json_value(data.get("acceptance"), list) or [])][:8],
+        "acceptance_review": [item for item in (_json_value(data.get("acceptance_review"), list) or [])
+                              if isinstance(item, dict)][:8],
         "needs_human_kind": _text(data.get("needs_human_kind")),
         # An internet-access request (services/network_access.py); credentials already masked.
         "network_request_reason": _text(data.get("network_request_reason"), "")[:1200],
@@ -902,7 +910,23 @@ def get_job_detail(job_id: str):
     result["lineage"] = _job_lineage(data)
     result["gate"] = _job_gate(data)
     result["related"] = _related_jobs(_text(data.get("id"), _key_suffix(key)))
+    result["timeline"] = _job_timeline(_text(data.get("id"), _key_suffix(key)))
     return _redact(result)
+
+
+def _job_timeline(job_id):
+    """The job's status changes (services/job_events.py writes them)."""
+    try:
+        entries = redis.xrange(f"laika:job-events:{job_id}", count=200)
+    except Exception:
+        return []
+    out = []
+    for _, fields in entries or []:
+        fields = fields or {}
+        out.append({"from": _text(fields.get("from")), "to": _text(fields.get("to")),
+                    "actor": _text(fields.get("actor")), "reason": _text(fields.get("reason")),
+                    "at": _number(fields.get("at")), "unexpected": fields.get("unexpected") == "1"})
+    return out
 
 
 def _json_value(value, expected):
@@ -939,9 +963,15 @@ def _job_gate(data):
     gate = _json_value(data.get("integration_result"), dict)
     if gate is None:
         return None
+    checks = [c for c in (gate.get("checks") or []) if isinstance(c, dict)][:60]
     return {
         "returncode": _number(gate.get("returncode")),
         "summary": str(gate.get("stdout") or "")[-3000:],
+        "errors": str(gate.get("stderr") or "")[-1500:],
+        "command": _text(gate.get("command")),
+        "seconds": _number(gate.get("seconds")),
+        "checks": [{"name": _text(c.get("name")), "result": _text(c.get("result")), "seconds": _number(c.get("seconds"))}
+                   for c in checks],
     }
 
 
@@ -1049,10 +1079,16 @@ def api_system_health():
 def api_providers():
     """Claude capacity (shared slots, cooldown) and per-role routing as the
     workers report it. Read-only; the workers own the semaphore."""
+    import provider_routes
     now_ts = time.time()
     try:
-        slots = redis.zrangebyscore("laika:provider-slots:claude", now_ts, "+inf", withscores=True)
-        limit = redis.get("laika:provider-limit:claude")
+        slots = []
+        limit = 0
+        for row in provider_routes.account_rows("claude", now_ts):
+            if row["enabled"]:
+                limit += row["max_concurrent"]
+            key = provider_routes._slots_key("claude", row["id"])
+            slots += redis.zrangebyscore(key, now_ts, "+inf", withscores=True)
         cooldown = redis.get("laika:provider-cooldown:claude")
         cooldown_ttl = redis.ttl("laika:provider-cooldown:claude") if cooldown else None
     except Exception:
@@ -1399,3 +1435,11 @@ app.include_router(users_router)
 app.include_router(assist_router)
 from remote_routes import router as remote_router  # noqa: E402
 app.include_router(remote_router)
+from why_routes import router as why_router  # noqa: E402
+app.include_router(why_router)
+from routing_routes import router as routing_router  # noqa: E402
+app.include_router(routing_router)
+from away_routes import router as away_router  # noqa: E402
+app.include_router(away_router)
+from backups_routes import router as backups_router  # noqa: E402
+app.include_router(backups_router)

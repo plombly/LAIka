@@ -17,7 +17,13 @@ import pwd
 import re
 import signal
 import subprocess
+import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling modules, also when loaded by path
+import provider_accounts  # noqa: E402
+import provider_health  # noqa: E402
 from pathlib import Path
 
 
@@ -41,16 +47,20 @@ DEFAULT_CLAUDE_BUDGET_USD = {
 READ_ONLY_TOOLS = "Read,Grep,Glob"
 EDIT_TOOLS = "Read,Edit,Write,Grep,Glob,Bash"
 
-COOLDOWN_KEY = "laika:provider-cooldown:claude"
+COOLDOWN_KEY = provider_health.cooldown_key("claude")
+# Holds now last until the reset time the provider reported (or a default
+# per kind of failure, services/provider_health.py); this is the default for
+# callers that give no reason LAIka can classify.
 COOLDOWN_SECONDS = int(os.getenv("CLAUDE_COOLDOWN_SECONDS", "1800"))
 # The claude CLI is a global install that updates itself (it is shared with
 # interactive sessions); during an update the executable is briefly missing
 # or half-installed. That is a short outage, not a failure.
-INSTALL_COOLDOWN_SECONDS = int(os.getenv("CLAUDE_INSTALL_COOLDOWN_SECONDS", "120"))
-_INSTALL_BROKEN = re.compile(
-    r"postinstall|optional dependency|No such file or directory|command not found|ENOENT|cannot execute",
-    re.IGNORECASE,
-)
+INSTALL_COOLDOWN_SECONDS = provider_health.INSTALL_SECONDS
+_INSTALL_BROKEN = provider_health.INSTALL_BROKEN
+# Claude reports its plan usage (5-hour and 7-day windows) in every
+# stream-json run; at this share LAIka stops sending it work until the
+# window resets, instead of waiting for a hard "limit reached" failure.
+EARLY_HOLD_PERCENT = float(os.getenv("CLAUDE_EARLY_HOLD_PERCENT", "95"))
 POLL_SECONDS = 2
 
 # Worktrees contain the operator's CLAUDE.md, which Claude Code loads. It is
@@ -63,11 +73,6 @@ AGENT_CONTRACT = (
     "Nobody can answer questions: decide, act, and report."
 )
 
-_UNAVAILABLE = re.compile(
-    r"hit your .*limit|usage limit|session limit|rate limit|not logged in|log ?in|"
-    r"authenticat|credit balance|overloaded",
-    re.IGNORECASE,
-)
 
 
 def _env_map(name):
@@ -121,6 +126,9 @@ def claude_command(role, model, budget_usd, allowed_bash=(), tools=None, system_
         "--output-format", "stream-json", "--verbose",
         "--no-session-persistence",
         "--strict-mcp-config",  # never load the operator's MCP connectors
+        # Only the laika user's own settings: a worktree's .claude/settings*.json
+        # was written by an AI and could add hooks or permissions.
+        "--setting-sources", "user",
         "--model", model,
         "--max-budget-usd", f"{budget_usd:.2f}",
         "--append-system-prompt", system_prompt,
@@ -138,7 +146,8 @@ def claude_command(role, model, budget_usd, allowed_bash=(), tools=None, system_
 
 
 class ClaudeRun:
-    def __init__(self, returncode, duration, result, timed_out=False, raw_tail=""):
+    def __init__(self, returncode, duration, result, timed_out=False, raw_tail="", account=None):
+        self.account = account or provider_accounts.DEFAULT  # which Claude account ran it
         self.returncode = returncode
         self.duration = duration
         self.result = result  # parsed JSON result, or None
@@ -164,16 +173,24 @@ class ClaudeRun:
         )
 
     @property
-    def unavailable(self):
-        """Claude could not serve this call (plan limit, auth, overload):
-        another provider should take it. Budget exhaustion or a bad answer
-        is not unavailability."""
+    def failure(self):
+        """provider_health.Failure when Claude could not serve the call, else
+        None. Only an error result is classified: budget exhaustion, max
+        turns or a bad answer are the task's failure, not Claude's."""
         if self.install_broken:
-            return True
+            return provider_health.Failure("unavailable", provider_health.excerpt(self.raw_tail))
         if self.result is None or not self.result.get("is_error"):
-            return False
-        status = self.result.get("api_error_status")
-        return status in (401, 403, 429, 529) or bool(_UNAVAILABLE.search(self.text))
+            return None
+        if self.result.get("subtype") in ("error_max_turns", "error_max_budget_usd"):
+            return None
+        found = provider_health.classify(self.text, self.result.get("api_error_status"))
+        return found if found.holds else None
+
+    @property
+    def unavailable(self):
+        """Claude could not serve this call (plan limit, rate limit, sign-in,
+        overload): another provider should take it."""
+        return self.failure is not None
 
     def describe_error(self):
         if self.timed_out:
@@ -187,10 +204,49 @@ class ClaudeRun:
         )
 
 
+# What an AI tool may see of LAIka's environment. LAIka's own jobs run
+# without the project sandbox, so its secrets (Redis, the database, the
+# operator token) would otherwise reach the agent and every test it runs.
+_SECRET_NAME = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|WEBHOOK|DATABASE_URL|REDIS_URL)",
+                          re.IGNORECASE)
+PROVIDER_CREDENTIALS = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"}
+
+
+def agent_env(base=None, home=None):
+    """base (default os.environ) without LAIka's secrets: every secret-named
+    variable except the providers' own credentials, which the CLIs need."""
+    source = dict(os.environ if base is None else base)
+    env = {k: v for k, v in source.items() if k in PROVIDER_CREDENTIALS or not _SECRET_NAME.search(k)}
+    env["HOME"] = home or source.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
+    return env
+
+
+def kill_group(pid, sig):
+    """Signal the process group of a child LAIka started with
+    start_new_session (so its group id is its pid). Never anything else:
+    group 1, LAIka's own group, or a non-pid. A test's fake process with
+    pid 1 once made this SIGKILL every service on the host (2026-10-18)."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or pid == os.getpgrp():
+        return False
+    try:
+        if os.getpgid(pid) != pid:
+            return False   # alive, but not the leader of its own group: not ours to kill
+    except ProcessLookupError:
+        pass               # the leader exited; its group (our child's) may remain
+    except PermissionError:
+        return False
+    try:
+        os.killpg(pid, sig)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
 def run_claude(role, prompt, cwd, log_path, timeout, model=None, budget_usd=None,
-               allowed_bash=(), tick=None, tools=None, wrap=None, system_prompt=AGENT_CONTRACT):
-    """Run `claude -p` for one role. The JSON result is written to log_path.
-    wrap(argv) -> argv runs it inside a sandbox (project_sandbox)."""
+               allowed_bash=(), tick=None, tools=None, wrap=None, system_prompt=AGENT_CONTRACT, account=None):
+    """Run `claude -p` for one role as account (None: the default one). The
+    JSON result is written to log_path. wrap(argv) -> argv runs it inside a
+    sandbox (project_sandbox)."""
     command = claude_command(
         role, model or claude_model(role),
         claude_budget(role) if budget_usd is None else budget_usd,
@@ -200,10 +256,12 @@ def run_claude(role, prompt, cwd, log_path, timeout, model=None, budget_usd=None
     )
     if wrap is not None:
         command = wrap(command)
-    env = {**os.environ, "HOME": os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir}
+    env = agent_env()
     token = claude_token(env["HOME"])
     if token:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    account = account or provider_accounts.DEFAULT
+    env = provider_accounts.apply_env(env, provider_accounts.env_for("claude", account, base=env["HOME"]))
     started = time.time()
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -215,7 +273,7 @@ def run_claude(role, prompt, cwd, log_path, timeout, model=None, budget_usd=None
                 stderr=subprocess.STDOUT, text=True, env=env, start_new_session=True,
             )
         except OSError as exc:  # executable missing mid-update
-            return ClaudeRun(127, time.time() - started, None, raw_tail=f"{exc}")
+            return ClaudeRun(127, time.time() - started, None, raw_tail=f"{exc}", account=account)
         try:
             process.stdin.write(prompt)
             process.stdin.close()
@@ -229,14 +287,15 @@ def run_claude(role, prompt, cwd, log_path, timeout, model=None, budget_usd=None
                     pass
             if time.time() - started >= timeout:
                 timed_out = True
-                os.killpg(process.pid, signal.SIGTERM)
+                kill_group(process.pid, signal.SIGTERM)
                 try:
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    kill_group(process.pid, signal.SIGKILL)
                     process.wait()
                 break
             time.sleep(POLL_SECONDS)
+        kill_group(process.pid, signal.SIGKILL)  # nothing the agent started may outlive it
     result = read_claude_result(log_path)
     raw_tail = ""
     if result is None:
@@ -244,7 +303,7 @@ def run_claude(role, prompt, cwd, log_path, timeout, model=None, budget_usd=None
             raw_tail = log_path.read_text(errors="replace")[-2000:]
         except OSError:
             pass
-    return ClaudeRun(process.returncode, time.time() - started, result, timed_out, raw_tail)
+    return ClaudeRun(process.returncode, time.time() - started, result, timed_out, raw_tail, account=account)
 
 
 def read_claude_result(log_path):
@@ -338,51 +397,43 @@ def claude_token(home=None):
 
 
 # Concurrency cap: every pipeline process shares these slots, so a large
-# batch cannot run more than CLAUDE_MAX_CONCURRENT Claude calls at once and
-# drain the operator's plan in minutes. A lease expires if its holder dies.
-SLOTS_KEY = "laika:provider-slots:claude"
-SLOT_LIMIT_KEY = "laika:provider-limit:claude"
-_ACQUIRE = """
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
-if redis.call('ZSCORE', KEYS[1], ARGV[3]) or redis.call('ZCARD', KEYS[1]) < tonumber(ARGV[4]) then
-  redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
-  return 1
-end
-return 0
-"""
+# batch cannot run more than each Claude account's limit at once and drain
+# a plan in minutes. Several accounts (services/provider_accounts.py) each
+# have their own limit; a run takes the account with the most room left.
+# A lease expires if its holder dies.
+
+
+SLOTS_KEY = provider_accounts.running_key("claude", provider_accounts.DEFAULT)
+_ACQUIRE = provider_accounts._ACQUIRE  # lease script, also used by the goal assistant's own slots
 
 
 def claude_slot_limit():
-    return max(1, int(os.getenv("CLAUDE_MAX_CONCURRENT", "2")))
+    return provider_accounts.default_limit("claude")
 
 
 def acquire_claude_slot(redis_client, holder, lease_seconds, now=None):
-    now = time.time() if now is None else now
-    limit = claude_slot_limit()
-    try:
-        redis_client.set(SLOT_LIMIT_KEY, str(limit))
-        return bool(redis_client.eval(_ACQUIRE, 1, SLOTS_KEY, str(now), str(now + lease_seconds),
-                                      holder, str(limit)))
-    except Exception:
-        return True  # never let slot bookkeeping stop the pipeline
+    """The account id now held for holder, or None (all full or paused)."""
+    return provider_accounts.acquire(redis_client, "claude", holder, lease_seconds, now=now)
 
 
-def release_claude_slot(redis_client, holder):
-    try:
-        redis_client.zrem(SLOTS_KEY, holder)
-    except Exception:
-        pass
+def release_claude_slot(redis_client, holder, account=None):
+    """Free holder's slot (account None: wherever it is)."""
+    accounts = [account] if account else [a["id"] for a in provider_accounts.accounts(redis_client, "claude")]
+    for name in accounts:
+        provider_accounts.release(redis_client, "claude", name, holder)
 
 
 def wait_for_claude_slot(redis_client, holder, lease_seconds, max_wait, tick=None, sleep=time.sleep):
-    """True once a slot is held (release it with release_claude_slot), or
-    False after max_wait seconds: the caller should use another provider."""
+    """The account id once a slot is held (release it with
+    release_claude_slot), or None after max_wait seconds: the caller should
+    use another provider."""
     deadline = time.time() + max_wait
     while True:
-        if acquire_claude_slot(redis_client, holder, lease_seconds):
-            return True
+        account = acquire_claude_slot(redis_client, holder, lease_seconds)
+        if account:
+            return account
         if time.time() >= deadline:
-            return False
+            return None
         if tick:
             try:
                 tick()
@@ -466,19 +517,169 @@ def combined_review_result(aspect_runs, aspect_verdicts):
 
 
 def claude_cooling_down(redis_client):
-    try:
-        return bool(redis_client.get(COOLDOWN_KEY))
-    except Exception:
-        return False
+    return provider_health.held(redis_client, "claude")
 
 
-def start_cooldown(redis_client, reason, seconds=None):
-    """Stop sending work to Claude for a while after it reported a limit, so
-    every job does not first burn a failed call before falling back. A CLI
-    being updated only needs a short pause (INSTALL_COOLDOWN_SECONDS)."""
-    if seconds is None:
-        seconds = INSTALL_COOLDOWN_SECONDS if _INSTALL_BROKEN.search(reason or "") else COOLDOWN_SECONDS
+def start_cooldown(redis_client, reason, seconds=None, failure=None, account=None):
+    """Stop sending work to Claude after it could not serve a call, so every
+    job does not first burn a failed call before falling back. The hold lasts
+    until the reset time Claude gave (+2 min), else a default for the kind of
+    failure; a CLI being updated only needs a short pause."""
+    failure = failure or provider_health.classify(reason)
+    if not failure.holds:  # a reason LAIka cannot classify: the old default
+        failure = provider_health.Failure("unavailable", provider_health.excerpt(reason))
+        if seconds is None and not _INSTALL_BROKEN.search(reason or ""):
+            seconds = COOLDOWN_SECONDS
+    if seconds is not None:
+        failure.until = time.time() + seconds - provider_health.MARGIN
+    provider_health.hold(redis_client, "claude", failure, account=account)
+
+
+def rate_limit_reading(log_path):
+    """Claude's last plan-usage report in a stream-json log:
+    {"status", "windows": {"five_hour": {"percent", "resets_at"}, ...}} or None."""
+    reading = None
     try:
-        redis_client.set(COOLDOWN_KEY, reason[:300] or "unavailable", ex=seconds)
+        lines = Path(log_path).read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if '"rate_limit_event"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        info = event.get("rate_limit_info") if isinstance(event, dict) else None
+        if not isinstance(info, dict):
+            continue
+        windows = {}
+        for name, window in (info.get("unifiedWindows") or {}).items():
+            if isinstance(window, dict) and isinstance(window.get("utilization"), (int, float)):
+                windows[name] = {"percent": round(float(window["utilization"]) * 100, 1),
+                                 "resets_at": window.get("resetsAt")}
+        reading = {"status": info.get("status") or "", "resets_at": info.get("resetsAt"), "windows": windows}
+    return reading
+
+
+def record_rate_limits(redis_client, log_path, now=None, account=None):
+    """Store Claude's latest plan-usage reading (dashboard) and hold Claude
+    until the window resets once a window passes the account's "stop at"
+    (provider_accounts.stop_percent) or Claude says it rejected the call.
+    Fails open: an unknown format does nothing."""
+    return apply_usage(redis_client, "claude", rate_limit_reading(log_path), now=now, account=account)
+
+
+def apply_usage(redis_client, provider, reading, now=None, account=None):
+    """Store a plan-usage reading {"status", "windows": {name: {percent,
+    resets_at}}} for provider's account, and hold the account until the
+    fullest window resets once it passes the account's "stop at"."""
+    if not reading:
+        return None
+    now = time.time() if now is None else now
+    try:
+        redis_client.set(provider_health.usage_key(provider, account), json.dumps({**reading, "at": now}),
+                         ex=8 * 86400)
     except Exception:
         pass
+    limit = provider_accounts.stop_percent(redis_client, provider, account)
+    full = [(name, window) for name, window in reading["windows"].items()
+            if window["percent"] >= limit and isinstance(window.get("resets_at"), (int, float))]
+    if reading.get("status") == "rejected" and isinstance(reading.get("resets_at"), (int, float)):
+        full.append(("current", {"percent": 100, "resets_at": reading["resets_at"]}))
+    if full:
+        name, window = max(full, key=lambda item: item[1]["resets_at"])
+        label = {"five_hour": "5-hour", "seven_day": "7-day"}.get(name, name.replace("_", " "))
+        failure = provider_health.Failure(
+            "quota", f"{label} window at {window['percent']:g}% of the plan (resets then)",
+            until=float(window["resets_at"]), hint="parsed")
+        provider_health.hold(redis_client, provider, failure, now=now, account=account)
+    return reading
+
+
+# --- Codex plan usage -------------------------------------------------------------------
+#
+# `codex exec --json` does not report plan usage, but the session file Codex
+# keeps for the run (CODEX_HOME/sessions/.../rollout-*-<thread id>.jsonl)
+# records its rate limits: the 5-hour and weekly windows' used percent and
+# reset times. LAIka reads the last reading and deletes the session file
+# (it holds the whole conversation), plus any older than a day that a
+# crashed run left behind.
+
+CODEX_WINDOWS = {300: "five_hour", 10080: "seven_day"}
+
+
+def codex_thread_id(log_path=None, text=None):
+    try:
+        text = Path(log_path).read_text(errors="replace") if text is None else text
+        for line in text.splitlines():
+            if '"thread.started"' in line:
+                return str(json.loads(line).get("thread_id") or "")
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def _find_rate_limits(value):
+    if isinstance(value, dict):
+        if isinstance(value.get("rate_limits"), dict):
+            return value["rate_limits"]
+        for item in value.values():
+            found = _find_rate_limits(item)
+            if found:
+                return found
+    return None
+
+
+def codex_session_reading(codex_home, thread_id, remove=True, now=None):
+    """The last plan-usage reading in this run's Codex session file, in
+    rate_limit_reading's format, or None. The file is removed."""
+    if not re.fullmatch(r"[0-9a-f-]{8,64}", thread_id or ""):
+        return None
+    sessions = Path(codex_home) / "sessions"
+    reading = None
+    for path in sessions.glob(f"*/*/*/rollout-*{thread_id}.jsonl"):
+        limits = None
+        try:
+            for line in path.read_text(errors="replace").splitlines():
+                if '"rate_limits"' in line:
+                    try:
+                        limits = _find_rate_limits(json.loads(line)) or limits
+                    except ValueError:
+                        continue
+        except OSError:
+            continue
+        if remove:
+            path.unlink(missing_ok=True)
+        windows = {}
+        for key in ("primary", "secondary"):
+            window = (limits or {}).get(key)
+            if isinstance(window, dict) and isinstance(window.get("used_percent"), (int, float)):
+                minutes = int(window.get("window_minutes") or 0)
+                windows[CODEX_WINDOWS.get(minutes, f"{minutes}_minutes")] = {
+                    "percent": round(float(window["used_percent"]), 1), "resets_at": window.get("resets_at")}
+        if windows:
+            reading = {"status": "", "windows": windows}
+    if remove:
+        prune_codex_sessions(sessions, now=now)
+    return reading
+
+
+def prune_codex_sessions(sessions, max_age=86400, now=None):
+    now = time.time() if now is None else now
+    for path in Path(sessions).glob("*/*/*/rollout-*.jsonl"):
+        try:
+            if now - path.stat().st_mtime > max_age:
+                path.unlink()
+        except OSError:
+            continue
+
+
+def record_codex_limits(redis_client, log_path, codex_home, account=None, now=None, text=None):
+    """Codex's plan usage after a run (see above): stored per account, and
+    the account paused at its "stop at" like Claude's. Never raises."""
+    try:
+        reading = codex_session_reading(codex_home, codex_thread_id(log_path, text), now=now)
+        return apply_usage(redis_client, "codex", reading, now=now, account=account)
+    except Exception:
+        return None

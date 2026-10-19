@@ -2,6 +2,142 @@
 
 All notable changes to LAIka. Versions follow [semantic versioning](https://semver.org).
 
+## 2.0.0 (2026-10-19)
+
+**Upgrading from 1.5:** update as usual (Settings → System → Update now,
+or `sudo laika update`); running jobs finish first. Nothing to redo:
+
+- Your Claude and Codex sign-ins and API keys become each provider's
+  "Default" account. A provider pause that is running when you update
+  keeps counting.
+- Changes are checked more strictly before integration and approval:
+  submodules, links out of the repository and odd paths are now refused,
+  and changes to files that steer tests, git or agents are flagged. A
+  change that deletes the project's tests now fails its tests.
+- Acceptance criteria, test evidence and the job History appear for work
+  planned or run after the update; older jobs keep what they had.
+- The Backups list in Settings → System fills after the first backup
+  after the update ("Back up now" does it at once).
+- A new notification, "An AI account needs signing in again or reached its
+  limit", pings administrators by default; change it in the notification
+  settings.
+- Backups keep the list of AI accounts and their API keys but not the
+  subscription sign-ins: after restoring a backup, sign the accounts in
+  again (the doctor lists them).
+
+**AI providers that don't waste attempts:**
+
+- Claude and Codex failures are sorted into usage limit, rate limit,
+  sign-in needed and outage, from the providers' own wording, and LAIka
+  reads the reset time they give ("try again in 2h 5m", "resets 3am
+  (America/Chicago)", …). A provider is paused until then (+2 minutes),
+  with sane caps; Codex gets the same pauses Claude always had.
+- A build that no provider can take right now waits for the reset without
+  using up an attempt (setting: provider waits before it counts as failed),
+  and a build whose worker was lost to a restart, crash or reboot runs the
+  same attempt again (setting: restarts survived per build).
+- Claude's own plan-usage report (5-hour and 7-day windows) is read from
+  every run: shown in Settings → AI, and at 95% (setting) LAIka pauses
+  Claude until the window resets instead of hitting the hard limit.
+- Settings → AI shows each provider's availability: taking work, or
+  paused until when and why. The watchdog reports pauses and waiting
+  builds. Signing a provider in again ends its pause.
+- Codex runs that exceed their time limit are force-stopped after 10
+  seconds, and anything an AI tool leaves running is cleaned up.
+- Error text shown on the dashboard is cleaned of secrets.
+
+**The AI worker is treated as an attacker** (before your approval, never
+instead of it):
+
+- A project's tests are chosen from main as it was before the change: the
+  operator's test command, else what main implies. A change that removes
+  the tests main had fails instead of passing with "nothing to run"; for
+  LAIka itself the gate script runs from main's copy.
+- Every change is checked at integration and again on the host at
+  approval: links out of the repository, submodules and odd paths
+  (".git", "..", control characters) are refused; changes to files that
+  steer tests, git or agents (git attributes, hooks, CI, CLAUDE.md,
+  conftest.py, package.json, …) are named to the reviewer and on the
+  Approve card.
+- Git runs hardened everywhere LAIka touches AI-written branches: no hooks
+  (a post-merge hook would have run at approval), no fsmonitor, no ext/file
+  transports, no submodule recursion, no repository diff drivers, no git
+  redirection variables. Approval merges the exact approved commit, checks
+  main is that commit afterwards, and refuses files hidden from git status.
+- An agent that changes git's config, hooks or attributes fails, and the
+  files are put back.
+- AI tools no longer see LAIka's secrets (Redis, database, operator token)
+  on LAIka's own jobs; Codex runs with plugins, apps, hooks and
+  browser/computer control off, and Claude loads only the laika user's own
+  settings (not settings files an AI could write into a project).
+
+**Correct job state through crashes and delays:**
+
+- Every run of a job gets its own identity, and a worker may only write
+  to its job while that identity still matches. A worker that stalled past
+  the lost-worker timeout and then woke up used to write its stale result
+  over the re-run's record; now it is turned away and stops quietly.
+- A plan's jobs and the goal's record are saved in one transaction: a crash
+  while saving can no longer leave half a plan that a re-plan duplicates.
+  Two jobs of one plan that touch the same file no longer start together.
+- Every job status change is recorded (who, from what, to what, why) and
+  shown as a History in the job's details; unusual changes are flagged and
+  logged (not refused yet).
+
+**Several AI accounts:**
+
+- Add more Claude and Codex accounts in Settings → AI → More accounts,
+  each a subscription sign-in or an API key, with its own number of runs
+  at once. Every run goes to the account with the most room left (fewest
+  runs going, then lowest plan usage), so limits are reached later and
+  evenly.
+- Pauses are per account: when one hits its usage limit, work carries on
+  with the others (a Claude run moves to another Claude account before
+  falling back to Codex; a build moves to another Codex account without
+  using a wait). A provider is paused only when all its accounts are.
+- Reviews and repairs that no provider can serve right now wait for it,
+  like builds: no review recovery or repair attempt is used.
+- Each job records which account ran it; Routing counts runs per account.
+- Codex's plan usage (5-hour and weekly windows) is now read too, from the
+  session file Codex keeps for each run (deleted right after), so Codex
+  accounts are paused before their limit just like Claude's. Each account
+  can have its own "Stop at" share of its plan: lower it on the plan you
+  also use yourself.
+- Administrators are notified when an account needs signing in again or
+  reaches its limit, and when every account of a provider is paused.
+- `laika doctor` checks the extra accounts' credentials: the key file is
+  root-only, sign-ins private, none left by removed accounts, every
+  account signed in.
+- Extra accounts' credentials stay on the server: sign-ins in LAIka's own
+  folder, API keys in a root-only file put in place by the host. A run
+  sees only its own account's credential, sandboxes none of the others.
+  Removing an account deletes its sign-in and key.
+
+**What you see:**
+
+- **Acceptance criteria per job.** The planner states what "done" means
+  for every job; the builder gets the list, the reviewer judges each one
+  (a criterion not met is a blocking finding), and the Approve card shows
+  the checklist with ✓ / ✗. Misspelled plan fields (e.g. "dependencies")
+  are read correctly and unknown ones are reported, never silently dropped.
+- **Test evidence** in a job's details: the command LAIka ran (chosen from
+  main), each check with its time, and the output.
+- **Why is this waiting?** on home cards and at the top of a job's
+  details: paused, waiting for a provider until when, every worker busy
+  (and its place in line), waiting for files or earlier jobs, in review,
+  in the merge queue, or waiting for you.
+- **Pause all new work** (Settings → Workers): workers take no new job and
+  no goal is planned; running jobs finish and approved changes still
+  merge. A banner shows while paused.
+- **While you were away** on the home page: what LAIka handled by itself
+  (restarts survived, waits for providers, automatic rebuilds).
+- **Routing** (Settings → AI): which AI did which work, every switch to
+  the other provider and why, waits that used no attempt, scaler decisions.
+- **Diagnostics** say what each failing check means and what to do.
+- **Backups** (Settings → System): the snapshots on the server with size,
+  contents and problems, the last restore check, and "Back up now" /
+  "Check a restore now".
+
 ## 1.5.3 (2026-10-15)
 
 Faster everywhere, found by watching a server with a few hundred jobs:

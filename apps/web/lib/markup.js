@@ -62,7 +62,21 @@ const detailRows = (job, fields) =>
     )
     .join('');
 const detailSection = (title, content) => `<section class="detail-block"><h3>${esc(title)}</h3>${content}</section>`;
+// What LAIka itself ran on the integrated change before review: the command
+// (chosen from main, never from the change), each check and its output.
+export const gateEvidenceMarkup = gate => {
+  const passed = Number(gate.returncode) === 0;
+  const head = `<p><b>${passed ? 'Passed' : 'Failed'}</b>${gate.command ? ` · <code>${esc(gate.command)}</code>` : ''}${gate.seconds != null ? ` · ${esc(gate.seconds)} s` : ''}</p>`;
+  const checks = Array.isArray(gate.checks) && gate.checks.length
+    ? `<ul class="plain-list gate-checks">${gate.checks.map(c => `<li><span class="crit ${c.result === 'pass' ? 'ok' : c.result === 'fail' ? 'bad' : 'unknown'}">${c.result === 'pass' ? '✓' : c.result === 'fail' ? '✗' : '–'}</span> ${esc(c.name)}${c.seconds != null ? ` <span class="subtle">${esc(c.seconds)} s</span>` : ''}</li>`).join('')}</ul>`
+    : '';
+  const output = gate.summary ? `<details><summary>Output (last part)</summary><pre class="gate-output">${esc(gate.summary)}</pre></details>` : '';
+  const errors = gate.errors ? `<details><summary>Errors</summary><pre class="gate-output">${esc(gate.errors)}</pre></details>` : '';
+  return head + checks + output + errors;
+};
+
 export const jobDetailMarkup = (job, now = Date.now() / 1000) => {
+  const whyLine = `<p class="why-line subtle" data-why-auto="${esc(job.id)}"></p>`;
   job = { ...job, _started: clockText(job.started_at, now), _finished: job.started_at == null ? '' : job.finished_at == null ? '—' : clockText(job.finished_at, now), _elapsed: job.started_at == null ? '' : job.finished_at == null ? elapsedMarkup(job.started_at, null, now) : elapsedText(job.elapsed_seconds) };
   const lineage = asObject(job.lineage) || {},
     reviewHistory = Array.isArray(lineage.review_findings_history) ? lineage.review_findings_history : [],
@@ -84,12 +98,7 @@ export const jobDetailMarkup = (job, now = Date.now() / 1000) => {
       ? `<ol>${sourceCommits.map(commit => `<li>${detailValue(commit)}</li>`).join('')}</ol>`
       : detailValue(null),
     gate = asObject(job.gate),
-    gateMarkup = gate
-      ? detailRows(gate, [
-          ['Return code', 'returncode'],
-          ['Summary', 'summary']
-        ])
-      : '<p>No gate result</p>',
+    gateMarkup = gate ? gateEvidenceMarkup(gate) : '<p>No gate result</p>',
     timingRows = job.started_at == null ? [] : [
       ['Started', '_started'],
       ['Finished', '_finished'],
@@ -98,7 +107,7 @@ export const jobDetailMarkup = (job, now = Date.now() / 1000) => {
     relatedMarkup = related.length
       ? `<div class="table-wrap"><table class="job-table"><thead><tr><th>Job</th><th>Role</th><th>Status</th><th>Review verdict</th><th>Duration</th><th>Started</th><th>Elapsed</th><th>Tokens</th><th>Created</th></tr></thead><tbody>${related.map(item => `<tr><td><button class="detail-button" data-detail="${esc(item.id)}">${esc(item.id)}</button></td><td>${esc(item.role)}</td><td>${esc(item.status)}</td><td>${esc(item.review_verdict)}</td><td>${esc(item.duration)}</td><td>${clockText(item.started_at, now)}</td><td>${item.started_at == null ? '' : item.finished_at == null ? elapsedMarkup(item.started_at, null, now) : elapsedText(item.elapsed_seconds)}</td><td>${esc(item.effective_tokens)}</td><td>${esc(item.created_at)}</td></tr>`).join('')}</tbody></table></div>`
       : detailValue(null);
-  return `<div class="detail-title"><h2>${detailValue(job.id)}</h2>${pill(job.status)}</div><section class="job-log-section"><h3>Live log</h3><div class="job-log" data-job-log="${esc(job.id)}"><div class="subtle">Loading…</div></div><button type="button" class="detail-button" data-job-log-tests="${esc(job.id)}">Show test output</button><pre class="job-test-log" hidden></pre></section>${detailSection(
+  return whyLine + `<div class="detail-title"><h2>${detailValue(job.id)}</h2>${pill(job.status)}</div><section class="job-log-section"><h3>Live log</h3><div class="job-log" data-job-log="${esc(job.id)}"><div class="subtle">Loading…</div></div><button type="button" class="detail-button" data-job-log-tests="${esc(job.id)}">Show test output</button><pre class="job-test-log" hidden></pre></section>${detailSection(
     'Summary',
     detailRows(job, [
       ['ID', 'id'],
@@ -107,6 +116,7 @@ export const jobDetailMarkup = (job, now = Date.now() / 1000) => {
       ['Role', 'role'],
       ['Worker', 'worker'],
       ['Provider', 'provider'],
+      ['AI account', 'provider_account'],
       ['Model', 'model'],
       ['Review status', 'review_status'],
       ['Review verdict', 'review_verdict'],
@@ -156,7 +166,19 @@ export const jobDetailMarkup = (job, now = Date.now() / 1000) => {
       ['Review job ID', 'review_job_id'],
       ['Review findings', 'review_findings']
     ]) + `<h4>Source candidate commits</h4>${sourceMarkup}<h4>Review history</h4>${historyMarkup}`
-  )}${detailSection('Gate', gateMarkup)}${detailSection('Related jobs', relatedMarkup)}`;
+  )}${detailSection('Test evidence', gateMarkup)}${detailSection('History', timelineMarkup(job.timeline, now))}${detailSection('Related jobs', relatedMarkup)}`;
+};
+
+// Every status change of the job (services/job_events.py): who, when, why.
+export const timelineMarkup = (timeline, now = Date.now() / 1000) => {
+  const items = Array.isArray(timeline) ? timeline : [];
+  if (!items.length) return '<p class="subtle">No recorded changes yet.</p>';
+  return `<ol class="job-timeline">${items
+    .map(
+      entry =>
+        `<li class="${entry.unexpected ? 'unexpected' : ''}"><span class="subtle">${esc(clockText(entry.at, now))}</span> <b>${esc(entry.from || 'new')} → ${esc(entry.to)}</b> <span class="subtle">by ${esc(entry.actor || '?')}</span>${entry.reason ? `<div class="subtle">${esc(entry.reason)}</div>` : ''}${entry.unexpected ? '<div class="subtle">Unusual change: reported to the operator log.</div>' : ''}</li>`
+    )
+    .join('')}</ol>`;
 };
 export const tokenStateText = auth =>
   !auth?.token_required
